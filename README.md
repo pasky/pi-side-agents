@@ -19,9 +19,14 @@ Keep your main coding flow unblocked by offloading side quests (questions, hotfi
 
 Early scaffold.
 
+## Docs
+
+- Architecture draft: `docs/architecture.md`
+- Implementation checklist: `docs/todo.md`
+
 ## Next steps
 
-1. Define architecture and data model (agent registry, worktree locks, session links).
+1. Confirm open design decisions (merge policy, branch naming, stale lock handling, approval flow).
 2. Implement `/agent` command baseline flow.
 3. Implement worktree pool management.
 4. Add child lifecycle scripts and finish skill.
