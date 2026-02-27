@@ -6,18 +6,40 @@ Parallel agent orchestration for Pi.
 
 Keep your main coding flow unblocked by offloading side quests (questions, hotfixes, cleanups, follow-ups) to background child Pi agents running in isolated worktrees and tmux windows.
 
-## Planned capabilities
+## Implemented (current)
 
-- `/agent <task>` to spawn a child agent in a dedicated tmux window
-- Child lifecycle scripts for deterministic setup/finish flow
-- Worktree pool with lock tracking and reuse
-- Parent statusline integration (agent state + tmux window id)
-- Agent control tools (`agent-start`, `agent-check`, `agent-wait-any`, `agent-send`)
-- Optional swarm workflows for overnight autonomous cleanup work
+- `/agent [-model ...] <task>` spawns a child Pi in a new tmux window
+- Dynamic worktree pool (`../<repo>-agent-worktree-%04d`) with `.pi/active.lock`
+- Worktree lock diagnostics (warn on locked worktrees not tracked in registry)
+- Shared registry at `.pi/parallel-agents/registry.json`
+- Statusline summary of active agents in project sessions
+- Agent control tools:
+  - `agent-start`
+  - `agent-check`
+  - `agent-wait-any`
+  - `agent-send`
+- Supporting commands:
+  - `/agents`
+  - `/agent-check <id>`
+  - `/agent-send <id> <prompt>`
+  - `/agent-setup` (scaffolds start/finish scripts + finish skill)
 
 ## Status
 
-Early scaffold.
+MVP in progress (baseline flow implemented).
+
+## Quick start
+
+1. In your project, run:
+   - `/agent-setup`
+2. Spawn a child:
+   - `/agent what does weirdMethod actually do?`
+3. Inspect status:
+   - statusline (`parallel-agents`)
+   - `/agents`
+   - `/agent-check a-0001`
+4. Send follow-up:
+   - `/agent-send a-0001 please also add tests`
 
 ## Docs
 
@@ -26,9 +48,8 @@ Early scaffold.
 
 ## Next steps
 
-1. Confirm open design decisions (merge policy, branch naming, stale lock handling, approval flow).
-2. Implement `/agent` command baseline flow.
-3. Implement worktree pool management.
-4. Add child lifecycle scripts and finish skill.
-5. Expose parent-agent control tools.
-6. Integrate statusline updates.
+1. Harden finalize/merge loop and add conflict-recovery tests.
+2. Improve runtime status fidelity (`thinking`/`tool`/`pending` detail) from child sessions.
+3. Add optional PR flow to finish skill/script.
+4. Add integration tests for concurrent agents and lock contention.
+5. Polish UX around stale lock diagnostics and cleanup workflows.

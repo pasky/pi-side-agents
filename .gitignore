@@ -23,3 +23,6 @@ tmp/
 *.swp
 *.swo
 .DS_Store
+
+# Local project runtime artifacts
+.pi/

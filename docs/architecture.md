@@ -252,5 +252,5 @@ UI can map these to compact labels/icons.
 
 ## 10) Remaining open decisions
 
-1. **Branch naming scheme**: `agent/<id>` only, or include slug (`agent/<id>-cleanup-foo`)?
-2. **Dependency bootstrap hook behavior**: should startup run a repo-specific command (configured), run autodetected install command, or skip by default?
+1. **Bootstrap strictness**: keep startup bootstrap as optional hook (`.pi/parallel-agent-bootstrap.sh`) or enforce policy checks (e.g., branch/head sync hard-fail) by default?
+2. **Status fidelity**: whether/how to expose richer live child states (`thinking` / `tool` / `pending`) instead of coarse runtime states only.
