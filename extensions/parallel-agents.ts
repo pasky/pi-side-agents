@@ -761,15 +761,17 @@ async function refreshOneAgentRuntime(record: AgentRecord): Promise<void> {
 		}
 	}
 
-	if (record.tmuxWindowId) {
-		const live = tmuxWindowExists(record.tmuxWindowId);
-		if (live) {
-			if (record.status === "allocating_worktree" || record.status === "spawning_tmux" || record.status === "starting") {
-				record.status = "running";
-				record.updatedAt = nowIso();
-			}
-			return;
+	if (!record.tmuxWindowId) {
+		return;
+	}
+
+	const live = tmuxWindowExists(record.tmuxWindowId);
+	if (live) {
+		if (record.status === "allocating_worktree" || record.status === "spawning_tmux" || record.status === "starting") {
+			record.status = "running";
+			record.updatedAt = nowIso();
 		}
+		return;
 	}
 
 	if (!isTerminalStatus(record.status)) {
