@@ -15,12 +15,16 @@
   ],
   "files": [
     "extensions/",
+    "skills/",
     "docs/",
     "README.md"
   ],
   "pi": {
     "extensions": [
       "./extensions"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "engines": {
