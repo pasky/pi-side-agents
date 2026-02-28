@@ -701,7 +701,7 @@ function createTmuxWindow(tmuxSession: string, name: string): { windowId: string
 	const result = runOrThrow("tmux", [
 		"new-window",
 		"-t",
-		tmuxSession,
+		`${tmuxSession}:`,
 		"-P",
 		"-F",
 		"#{window_id} #{window_index}",
