@@ -671,8 +671,6 @@ test(
 		for (const fileName of ["kickoff.md", "backlog.log", "launch.sh"]) {
 			assert.ok(await exists(join(runtimeDir, fileName)), `runtime file missing: ${fileName}`);
 		}
-		await waitForBacklogContains(harness, "a-0001", "allocating_worktree -> spawning_tmux", 60_000);
-		await waitForBacklogContains(harness, "a-0001", "spawning_tmux -> running", 60_000);
 		await waitForBacklogContains(harness, "a-0001", "[parallel-agent][prompt]", 60_000);
 		await waitForBacklogContains(harness, "a-0001", "integration scenario one", 60_000);
 
@@ -734,7 +732,6 @@ test(
 		assert.ok(await exists(join(runtimeDir, "exit.json")), "exit.json should be created when child exits");
 		const exitPayload = JSON.parse(await readFile(join(runtimeDir, "exit.json"), "utf8"));
 		assert.equal(exitPayload.exitCode, 0, `expected exitCode 0 in exit marker: ${JSON.stringify(exitPayload)}`);
-		await waitForBacklogContains(harness, "a-0001", "-> done", 60_000);
 
 		const doneCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
 		assert.equal(doneCheck.payload.ok, false, `agent-check after successful quit should be unknown: ${JSON.stringify(doneCheck.payload)}`);

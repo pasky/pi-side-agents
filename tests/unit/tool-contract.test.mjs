@@ -502,16 +502,90 @@ test("agent-send '/' prefix is forwarded verbatim (no special parse)", () => {
 // 5. Branch naming convention
 // ---------------------------------------------------------------------------
 
-test("agent branch name follows parallel-agent/<id> convention", () => {
+// ---------------------------------------------------------------------------
+// Slug generation helpers (kept in sync with extensions/parallel-agents.ts)
+// ---------------------------------------------------------------------------
+
+function sanitizeSlug(raw) {
+	return raw
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.split("-")
+		.filter(Boolean)
+		.slice(0, 3)
+		.join("-");
+}
+
+function slugFromTask(task) {
+	const stopWords = new Set(["a", "an", "the", "to", "in", "on", "at", "of", "for", "and", "or", "is", "it", "be", "do", "with"]);
+	const words = task
+		.replace(/[^a-zA-Z0-9\s]/g, " ")
+		.split(/\s+/)
+		.map((w) => w.toLowerCase())
+		.filter((w) => w.length > 0 && !stopWords.has(w));
+	const slug = words.slice(0, 3).join("-");
+	return slug || "agent";
+}
+
+function deduplicateSlug(slug, existing) {
+	if (!existing.has(slug)) return slug;
+	for (let i = 2; ; i++) {
+		const candidate = `${slug}-${i}`;
+		if (!existing.has(candidate)) return candidate;
+	}
+}
+
+test("sanitizeSlug — basic kebab-case conversion", () => {
+	assert.strictEqual(sanitizeSlug("Fix Auth Leak"), "fix-auth-leak");
+	assert.strictEqual(sanitizeSlug("  ADD retry LOGIC  "), "add-retry-logic");
+	assert.strictEqual(sanitizeSlug("hello---world"), "hello-world");
+});
+
+test("sanitizeSlug — truncates to 3 words", () => {
+	assert.strictEqual(sanitizeSlug("one two three four five"), "one-two-three");
+});
+
+test("sanitizeSlug — strips special chars", () => {
+	assert.strictEqual(sanitizeSlug("fix: the bug!"), "fix-the-bug");
+	assert.strictEqual(sanitizeSlug("...leading-dots..."), "leading-dots");
+});
+
+test("sanitizeSlug — empty input returns empty string", () => {
+	assert.strictEqual(sanitizeSlug(""), "");
+	assert.strictEqual(sanitizeSlug("!!!"), "");
+});
+
+test("slugFromTask — extracts meaningful words, skips stop words", () => {
+	assert.strictEqual(slugFromTask("Fix the auth leak in the login page"), "fix-auth-leak");
+	assert.strictEqual(slugFromTask("Add a retry to the upload logic"), "add-retry-upload");
+});
+
+test("slugFromTask — falls back to 'agent' for empty/stopword-only input", () => {
+	assert.strictEqual(slugFromTask(""), "agent");
+	assert.strictEqual(slugFromTask("the a an"), "agent");
+});
+
+test("deduplicateSlug — returns slug as-is when no collision", () => {
+	assert.strictEqual(deduplicateSlug("fix-auth", new Set()), "fix-auth");
+	assert.strictEqual(deduplicateSlug("fix-auth", new Set(["other"])), "fix-auth");
+});
+
+test("deduplicateSlug — appends suffix on collision", () => {
+	assert.strictEqual(deduplicateSlug("fix-auth", new Set(["fix-auth"])), "fix-auth-2");
+	assert.strictEqual(deduplicateSlug("fix-auth", new Set(["fix-auth", "fix-auth-2"])), "fix-auth-3");
+});
+
+test("agent branch name follows parallel-agent/<slug> convention", () => {
 	function branchForId(id) {
 		return `parallel-agent/${id}`;
 	}
 
-	assert.strictEqual(branchForId("a-0001"), "parallel-agent/a-0001");
-	assert.strictEqual(branchForId("a-0042"), "parallel-agent/a-0042");
+	assert.strictEqual(branchForId("fix-auth-leak"), "parallel-agent/fix-auth-leak");
+	assert.strictEqual(branchForId("add-retry"), "parallel-agent/add-retry");
 
 	// Branch must not start with a slash or dot
-	const branch = branchForId("a-0001");
+	const branch = branchForId("fix-auth-leak");
 	assert.ok(!branch.startsWith("/"), "branch must not start with /");
 	assert.ok(!branch.startsWith("."), "branch must not start with .");
 });
