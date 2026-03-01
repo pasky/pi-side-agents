@@ -1265,6 +1265,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		await fs.chmod(launchScriptPath, 0o755);
 
 		tmuxPipePaneToFile(windowId, logPath);
+		// Run cd in the interactive pane shell first so Ctrl+Z in child Pi drops
+		// back to the child worktree prompt (not the parent worktree).
+		tmuxSendLine(windowId, `cd ${shellQuote(worktree.worktreePath)}`);
 		tmuxSendLine(windowId, `bash ${shellQuote(launchScriptPath)}`);
 
 		await mutateRegistry(stateRoot, async (registry) => {
