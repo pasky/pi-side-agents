@@ -1634,7 +1634,10 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			} else {
 				for (const record of records) {
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
-					lines.push(`${record.id}  ${record.status}  win:${win}  branch:${record.branch ?? "-"}`);
+					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
+					lines.push(
+						`${record.id}  ${record.status}  win:${win}  branch:${record.branch ?? "-"}  worktree:${worktreeName}`,
+					);
 					lines.push(`  task: ${summarizeTask(record.task)}`);
 					if (record.error) lines.push(`  error: ${record.error}`);
 					if (record.status === "failed" || record.status === "crashed") {

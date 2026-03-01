@@ -680,6 +680,11 @@ test(
 
 		await sendParentCommand(harness, "/agents");
 		await waitForParentContains(harness, "a-0001", 30_000);
+		await waitForParentContains(
+			harness,
+			`branch:${started.branch}  worktree:${basename(started.worktreePath)}`,
+			30_000,
+		);
 
 		const runningCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
 		assert.equal(runningCheck.payload.ok, true, `agent-check should succeed: ${JSON.stringify(runningCheck.payload)}`);
