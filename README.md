@@ -13,6 +13,7 @@ Keep your main coding flow unblocked by offloading side quests (questions, hotfi
 - Worktree lock diagnostics (warn on locked worktrees not tracked in registry)
 - Shared registry at `.pi/parallel-agents/registry.json`
 - Statusline summary of active agents in project sessions
+- Parent-side agent state-change feed as append-only `parallel-agent-status` messages in session history (plus error toasts for failed/crashed transitions)
 - Agent control tools (tool-only; no `/agent-check` or `/agent-send` slash commands):
   - `agent-start`
   - `agent-check`
@@ -86,7 +87,7 @@ After review, parent/user asks the child to wrap up (finish flow), then quits it
 
 Inspect the current status and recent output of an agent.
 
-`agent.task` is a compact preview; `backlog` is ANSI-stripped + truncated for safe LLM context usage, and includes synthetic `[parallel-agent][status] ... old -> new` notices for parent-observed lifecycle transitions.
+`agent.task` is a compact preview; `backlog` is ANSI-stripped + truncated for safe LLM context usage, and includes synthetic `[parallel-agent][prompt] ...` kickoff-prompt lines written by the parent.
 
 **Input**: `{ "id": "a-0001" }`
 

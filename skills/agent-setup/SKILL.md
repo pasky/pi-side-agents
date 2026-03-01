@@ -11,6 +11,8 @@ Initial first time setup (no .pi/parallel-agent* yet): Work through two phases: 
 
 Update setup: Chat with the user about what needs changing, use file examples below as reference for comparison.
 
+**Important (local-only files):** everything this skill creates is under `.pi/` and is runtime/local configuration. Do **not** `git add`, `git add -f`, or commit these files. They should remain untracked. If they were accidentally committed, remove them from git tracking while keeping them locally.
+
 ## Phase 1: Interview
 
 Ask the user the following questions. You may ask them all at once or one at a time — use your judgment based on how they engage.
@@ -301,7 +303,10 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it"):
 
 ## Phase 3: Report
 
-Tell the user which files were created, updated, or skipped, and how to proceed:
+Tell the user which files were created, updated, or skipped, and how to proceed.
+
+Explicitly remind the user that `.pi/parallel-agent-*` files are local runtime setup and should stay untracked (not committed to git).
+
 
 - Start an agent: `/agent <task description>`
 - Watch status: statusline shows active agents, ...@<number> is the tmux window to switch to; `/agents` lists all
