@@ -104,6 +104,7 @@ type StartAgentResult = {
 	worktreePath: string;
 	branch: string;
 	warnings: string[];
+	prompt: string;
 };
 
 type ExitMarker = {
@@ -152,6 +153,7 @@ function isTerminalStatus(status: AgentStatus): boolean {
 }
 
 const STATUS_TRANSITION_PREFIX = "[parallel-agent][status]";
+const PROMPT_LOG_PREFIX = "[parallel-agent][prompt]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
@@ -184,6 +186,32 @@ async function appendStatusTransitionToBacklog(
 		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
 	} catch {
 		// Best effort only; status updates must not fail if backlog append fails.
+	}
+}
+
+async function appendKickoffPromptToBacklog(
+	stateRoot: string,
+	record: AgentRecord,
+	prompt: string,
+	loggedAt = nowIso(),
+): Promise<void> {
+	const backlogPath = resolveBacklogPathForRecord(stateRoot, record);
+	const promptLines = prompt.replace(/\r\n?/g, "\n").split("\n");
+	const body = promptLines
+		.map((line) => `${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: ${line}`)
+		.join("\n");
+	const payload =
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt begin\n` +
+		`${body}\n` +
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt end\n`;
+
+	try {
+		await ensureDir(dirname(backlogPath));
+		await fs.appendFile(backlogPath, payload, "utf8");
+		record.logPath = record.logPath ?? backlogPath;
+		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
+	} catch {
+		// Best effort only; prompt logging must not block agent startup.
 	}
 }
 
@@ -1309,6 +1337,29 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
 
 		await atomicWrite(promptPath, kickoff.prompt + "\n");
+		try {
+			await mutateRegistry(stateRoot, async (registry) => {
+				const record = registry.agents[agentId];
+				if (!record) return;
+				await appendKickoffPromptToBacklog(stateRoot, record, kickoff.prompt);
+			});
+		} catch {
+			// Best effort fallback when registry lock/update fails; write directly
+			// to the known backlog path without requiring registry mutation.
+			await appendKickoffPromptToBacklog(
+				stateRoot,
+				{
+					id: agentId,
+					task: params.task,
+					status: "spawning_tmux",
+					startedAt: now,
+					updatedAt: nowIso(),
+					runtimeDir,
+					logPath,
+				},
+				kickoff.prompt,
+			);
+		}
 
 		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
 		const modelSpec = resolvedModel.modelSpec;
@@ -1368,6 +1419,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			worktreePath: worktree.worktreePath,
 			branch: worktree.branch,
 			warnings: aggregatedWarnings,
+			prompt: kickoff.prompt,
 		};
 	} catch (err) {
 		if (spawnedWindowId) {
@@ -1694,6 +1746,10 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 				];
 				for (const warning of started.warnings) {
 					lines.push(`warning: ${warning}`);
+				}
+				lines.push("", "prompt:");
+				for (const line of started.prompt.split(/\r?\n/)) {
+					lines.push(`  ${line}`);
 				}
 				renderInfoMessage(pi, ctx, "parallel-agent started", lines);
 				await renderStatusLine(ctx).catch(() => {});
