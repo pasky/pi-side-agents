@@ -2,7 +2,7 @@
 
 ## Current decisions
 
-- Default finish path is local merge (with explicit in-skill user confirmation).
+- Default finish path is local rebase + fast-forward (with explicit in-skill user confirmation).
 - `/agent` includes context summary by default.
 - Worktree pool is dynamic (no hard cap).
 - Stale locks are warning-only by default in MVP; `/agents` can offer user-confirmed auto-reclaim for orphan worktree locks.
@@ -44,7 +44,7 @@
 - [ ] Enforce branch/head sync policy in start script (currently lightweight bootstrap hook only).
 - [x] Resync `.pi` and run dependency/bootstrap hook surface.
 - [x] Scaffold `.pi/parallel-agent-skills/finish/SKILL.md`.
-- [x] Implement `.pi/parallel-agent-finish.sh` for deterministic merge loop baseline.
+- [x] Implement `.pi/parallel-agent-finish.sh` for deterministic rebase + fast-forward loop baseline.
 
 **Exit criteria**: scaffolded and functional baseline; policy hardening still needed.
 
@@ -87,5 +87,5 @@
 ## Stretch goals
 
 - [ ] Overnight autonomous chore planner (spawn N agents from one prompt).
-- [ ] Policy profiles (`local-merge`, `pr-only`, `read-only-main`).
+- [ ] Policy profiles (`local-rebase`, `pr-only`, `read-only-main`).
 - [ ] Optional persistent dashboard view.

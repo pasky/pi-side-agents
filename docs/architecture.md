@@ -9,7 +9,7 @@ Primary outcomes:
 - No context-switch blocking in the main session.
 - Safe parallel code changes via isolated branches/worktrees.
 - Quick observability (statusline + check commands).
-- Deterministic child lifecycle (start/setup → work → finish/merge/PR).
+- Deterministic child lifecycle (start/setup → work → finish/rebase/PR).
 
 ## 2) Scope
 
@@ -143,10 +143,10 @@ Responsibilities:
 - Typical trigger: explicit child-local user approval (e.g., “LGTM”).
 - Finish skill instruction should discuss/confirm finish action with user before executing.
 - Default finish algorithm (`.pi/parallel-agent-finish.sh`):
-  1. In child worktree on `parallel-agent/<id>`, run `git merge main`.
-  2. If merge conflicts, abort/restore and keep user in child branch for resolution/retry.
-  3. If successful, enter short critical section in parent checkout and merge `parallel-agent/<id>` into parent `main`.
-  4. If parent-side merge conflicts (because main moved), abort parent merge, return to child worktree, re-run step 1, retry.
+  1. In child worktree on `parallel-agent/<id>`, run `git rebase main`.
+  2. If rebase conflicts, keep user in child branch for resolution (`git rebase --continue`) and retry.
+  3. If successful, enter short critical section in parent checkout and fast-forward `main` to `parallel-agent/<id>` (`git merge --ff-only`).
+  4. If parent-side fast-forward fails (because main moved), return to child worktree, re-run step 1, retry.
   5. On success, release worktree lock and let the launcher exit with code 0 (successful agents are auto-pruned from registry).
 - Optional alternative flow: create/push PR when explicitly requested.
 
@@ -194,7 +194,7 @@ Suggested lock contents (diagnostic JSON):
 
 Behavior:
 
-- Lock is held only for parent-side `parallel-agent/<id> -> main` merge attempt.
+- Lock is held only for parent-side `parallel-agent/<id> -> main` fast-forward attempt.
 - If busy, finishing agents wait/retry with progress status.
 - On stale lock detection, warn with manual recovery instructions (consistent with warn-only lock policy).
 
@@ -234,8 +234,8 @@ UI can map these to compact labels/icons.
 - If child crashes: mark `crashed`, retain logs/backlog pointer.
 - If tmux window disappears unexpectedly: mark `failed` with diagnostics.
 - If lock exists without live child and no registry record: show stale-lock warning + recovery guidance.
-- If parent merge conflicts because `main` moved: abort parent merge, return to child branch reconcile step, retry.
-- If finish merge fails for other reasons: keep branch/worktree, emit actionable next steps.
+- If parent fast-forward fails because `main` moved: return to child branch rebase step, retry.
+- If finish integration fails for other reasons: keep branch/worktree, emit actionable next steps.
 - If merge lock appears stale: warn and provide manual recovery guidance.
 
 ## 8) Security / safety constraints
@@ -246,7 +246,7 @@ UI can map these to compact labels/icons.
 
 ## 9) Agreed defaults (2026-02-27)
 
-- Finish policy default: **local merge**.
+- Finish policy default: **local rebase + fast-forward**.
 - Finish skill must **discuss/confirm** the action with user before running it.
 - Parent checkout read-only mode: **not enforced**.
 - `/agent` handoff/context summary: **enabled by default**.

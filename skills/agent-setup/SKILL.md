@@ -12,8 +12,10 @@ Finish by backing up this agent-setup SKILL.md to .pi/parallel-agents/agent-star
 
 Update setup: Chat with the user about what needs changing, use file examples below as reference for comparison.
 
-Upgrade setup to new pi-parallel-agents version: Diff this file with the current backup .pi/parallel-agents/agent-start~/
+Upgrade setup to new pi-parallel-agents version: Diff this file with the current backup `.pi/parallel-agents/agent-start~/`
 and discuss the changes to apply (or not) with the user. When upgrade is finished, update the backup to the current version.
+
+**Important (local-only files):** everything this skill creates is under `.pi/` and is runtime/local configuration. Do **not** `git add`, `git add -f`, or commit these files. They should remain untracked. If they were accidentally committed, remove them from git tracking while keeping them locally.
 
 ## Phase 1: Interview
 
@@ -23,8 +25,8 @@ Ask the user the following questions. You may ask them all at once or one at a t
 
 2. **Bootstrap steps** – Does each agent worktree need custom setup before work begins? For example: `npm install`, copying `.env` files, running migrations. If yes, what commands specifically?
 
-3. **Merge policy** – When an agent finishes, should it:
-   - **Merge locally** into the main branch in the parent checkout (default), or
+3. **Finish policy** – When an agent finishes, should it:
+   - **Rebase locally, then fast-forward** into the main branch in the parent checkout (default), or
    - **Open a pull request** instead?
 
 4. **Overwrite existing files** – If `.pi/parallel-agent-start.sh` or similar already exist, overwrite them? *(default: no — skip existing files)*
@@ -132,7 +134,7 @@ Write this file and make it executable (`chmod +x`).
 
 Use `MAIN_BRANCH` set to whatever the user specified (or `main` by default).
 
-**For local merge policy** (default), use this content — substituting `MAIN_BRANCH_VALUE` with the actual branch name:
+**For local rebase policy** (default), use this content — substituting `MAIN_BRANCH_VALUE` with the actual branch name:
 
 ```bash
 #!/usr/bin/env bash
@@ -186,10 +188,10 @@ release_lock() {
 trap 'release_lock' EXIT
 
 while true; do
-  echo "[parallel-agent-finish] Reconciling child branch: git merge $MAIN_BRANCH"
-  if ! git merge "$MAIN_BRANCH"; then
-    echo "[parallel-agent-finish] Conflict while merging $MAIN_BRANCH into $BRANCH."
-    echo "Resolve conflicts here, then rerun .pi/parallel-agent-finish.sh"
+  echo "[parallel-agent-finish] Reconciling child branch: git rebase $MAIN_BRANCH"
+  if ! git rebase "$MAIN_BRANCH"; then
+    echo "[parallel-agent-finish] Conflict while rebasing $BRANCH onto $MAIN_BRANCH."
+    echo "Resolve conflicts (git status / git rebase --continue), then rerun .pi/parallel-agent-finish.sh"
     exit 2
   fi
 
@@ -199,7 +201,7 @@ while true; do
   (
     cd "$PARENT_ROOT" || exit 1
     git checkout "$MAIN_BRANCH" >/dev/null 2>&1 || exit 1
-    git merge --no-edit "$BRANCH"
+    git merge --ff-only "$BRANCH"
   )
   merge_status=$?
   set -e
@@ -207,17 +209,13 @@ while true; do
   release_lock
 
   if [[ "$merge_status" -eq 0 ]]; then
-    echo "[parallel-agent-finish] Success: merged $BRANCH -> $MAIN_BRANCH in parent checkout."
+    echo "[parallel-agent-finish] Success: fast-forwarded $MAIN_BRANCH to include $BRANCH in parent checkout."
     rm -f "$(pwd)/.pi/active.lock" || true
     exit 0
   fi
 
-  echo "[parallel-agent-finish] Parent merge failed (likely $MAIN_BRANCH moved)."
-  echo "[parallel-agent-finish] Aborting parent merge and retrying reconcile loop..."
-  (
-    cd "$PARENT_ROOT" || exit 1
-    git merge --abort >/dev/null 2>&1 || true
-  )
+  echo "[parallel-agent-finish] Parent fast-forward failed (likely $MAIN_BRANCH moved)."
+  echo "[parallel-agent-finish] Retrying rebase reconcile loop..."
 
   sleep 1
 done
@@ -246,12 +244,12 @@ gh pr create --base "$MAIN_BRANCH" --head "$BRANCH" --fill
 
 This is a skill for the **child agent** (not this session) that tells it how to finalize its work.
 
-**For local merge policy**, write:
+**For local rebase policy**, write:
 
 ```markdown
 ---
 name: finish
-description: Merge the branch with current work to upstream after explicit user sign-off (e.g. "LGTM")
+description: Rebase the branch with current work onto upstream and fast-forward it after explicit user sign-off (e.g. "LGTM")
 ---
 
 # Parallel-agent finish workflow
@@ -266,16 +264,16 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it", "merge 
 PI_PARALLEL_PARENT_REPO="$PI_PARALLEL_PARENT_REPO" .pi/parallel-agent-finish.sh
 ```
 
-3. If the finish script exits with code 2 (conflict merging MAIN_BRANCH_VALUE into child branch):
+3. If the finish script exits with code 2 (conflict rebasing child branch onto MAIN_BRANCH_VALUE):
    - Stay in this worktree
-   - Resolve conflicts manually
-   - Re-run the finish script
+   - Resolve conflicts (`git status`, then `git rebase --continue`)
+   - Re-run the finish script after the rebase completes
 
-4. If the parent-side merge fails because MAIN_BRANCH_VALUE moved ahead:
-   - The finish script retries the reconcile loop automatically
-   - Parent-side merge is a bit sensitive operation as it can make big mess; solve simple issues yourself, but escalate to the user with major issues (such as dirty parent worktree)
+4. If the parent-side fast-forward fails because MAIN_BRANCH_VALUE moved ahead:
+   - The finish script retries the rebase reconcile loop automatically
+   - Parent-side integration is a bit sensitive operation as it can make big mess; solve simple issues yourself, but escalate to the user with major issues (such as dirty parent worktree)
 
-5. After success: report the merged commit(s). Suggest `/quit` if no further work is needed.
+5. After success: report the landed commit(s). Suggest `/quit` if no further work is needed.
 ```
 
 **For PR policy**, write a simpler finish skill:
@@ -305,7 +303,10 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it"):
 
 ## Phase 3: Report
 
-Tell the user which files were created, updated, or skipped, including backup/reference files, and how to proceed:
+Tell the user which files were created, updated, or skipped, including backup/reference files, and how to proceed.
+
+Explicitly remind the user that `.pi/parallel-agent-*` files are local runtime setup and should stay untracked (not committed to git).
+
 
 - Backup reference for future diffs
 - Start an agent: `/agent <task description>`

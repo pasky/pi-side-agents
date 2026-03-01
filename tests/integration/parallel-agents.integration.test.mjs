@@ -432,12 +432,50 @@ async function callAgentSendTool(harness, id, prompt, timeoutMs = 90_000) {
 	return callToolViaPrompt(harness, "agent-send", { id, prompt }, { timeoutMs, retries: 3 });
 }
 
-async function closeChildWindowAfterPrompt(harness, agentId) {
-	const agent = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-	const windowId = agent.tmuxWindowId;
-	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId`);
+async function readWindowIdFromLaunchScript(harness, agentId) {
+	const launchPath = join(harness.repoRoot, ".pi", "parallel-agents", "runtime", agentId, "launch.sh");
+	if (!(await exists(launchPath))) return undefined;
+	const raw = await readFile(launchPath, "utf8").catch(() => "");
+	const match = raw.match(/(?:^|\n)WINDOW_ID=(?:'([^']+)'|"([^"]+)"|([^\s\n]+))/);
+	return match?.[1] || match?.[2] || match?.[3];
+}
 
+async function resolveChildWindowId(harness, agentId) {
+	const registry = await readRegistry(harness);
+	const fromRegistry = registry.agents?.[agentId]?.tmuxWindowId;
+	if (typeof fromRegistry === "string" && fromRegistry.length > 0) {
+		return fromRegistry;
+	}
+
+	const fromLaunchScript = await readWindowIdFromLaunchScript(harness, agentId);
+	if (fromLaunchScript) {
+		return fromLaunchScript;
+	}
+
+	const list = tmux(harness, ["list-windows", "-F", "#{window_id} #{window_name}"], { allowFailure: true });
+	if (list.status !== 0) {
+		return undefined;
+	}
+	for (const line of list.stdout.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const [windowId, ...nameParts] = trimmed.split(/\s+/);
+		if (nameParts.join(" ") === `agent-${agentId}`) {
+			return windowId;
+		}
+	}
+
+	return undefined;
+}
+
+async function closeChildWindowAfterPrompt(harness, agentId, windowIdHint) {
 	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
+
+	const terminalRecord = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 }).catch(
+		() => undefined,
+	);
+	const windowId = windowIdHint || terminalRecord?.tmuxWindowId || (await resolveChildWindowId(harness, agentId));
+	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId (registry/launch.sh fallback)`);
 
 	if (!windowExists(harness, windowId)) {
 		return;
@@ -660,6 +698,8 @@ test(
 
 		await sendParentCommand(harness, `/agent -model ${MODEL_SPEC} integration scenario one`);
 		const started = await waitForSpawnedAgent(harness, "a-0001");
+		await waitForParentContains(harness, "parallel-agent started", 45_000);
+		await waitForParentContains(harness, "prompt:", 45_000);
 
 		assert.equal(started.branch, "parallel-agent/a-0001");
 		assert.ok(started.worktreePath, "worktreePath should be recorded");
@@ -669,8 +709,8 @@ test(
 		for (const fileName of ["kickoff.md", "backlog.log", "launch.sh"]) {
 			assert.ok(await exists(join(runtimeDir, fileName)), `runtime file missing: ${fileName}`);
 		}
-		await waitForBacklogContains(harness, "a-0001", "allocating_worktree -> spawning_tmux", 60_000);
-		await waitForBacklogContains(harness, "a-0001", "spawning_tmux -> running", 60_000);
+		await waitForBacklogContains(harness, "a-0001", "[parallel-agent][prompt]", 60_000);
+		await waitForBacklogContains(harness, "a-0001", "integration scenario one", 60_000);
 
 		const launchScript = await readFile(join(runtimeDir, "launch.sh"), "utf8");
 		assert.ok(
@@ -730,7 +770,6 @@ test(
 		assert.ok(await exists(join(runtimeDir, "exit.json")), "exit.json should be created when child exits");
 		const exitPayload = JSON.parse(await readFile(join(runtimeDir, "exit.json"), "utf8"));
 		assert.equal(exitPayload.exitCode, 0, `expected exitCode 0 in exit marker: ${JSON.stringify(exitPayload)}`);
-		await waitForBacklogContains(harness, "a-0001", "-> done", 60_000);
 
 		const doneCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
 		assert.equal(doneCheck.payload.ok, false, `agent-check after successful quit should be unknown: ${JSON.stringify(doneCheck.payload)}`);
@@ -738,7 +777,6 @@ test(
 			typeof doneCheck.payload.error === "string" && doneCheck.payload.error.includes("Unknown agent id"),
 			`expected unknown-agent error after cleanup: ${JSON.stringify(doneCheck.payload)}`,
 		);
-		await waitForParentContains(harness, "Press any key to close this tmux window", 30_000);
 
 		await closeChildWindowAfterPrompt(harness, "a-0001");
 	},
@@ -940,9 +978,9 @@ release_lock() {
 trap 'release_lock' EXIT
 
 while true; do
-  echo "[parallel-agent-finish] Reconciling child branch: git merge $MAIN_BRANCH"
-  if ! git merge "$MAIN_BRANCH"; then
-    echo "[parallel-agent-finish] Conflict while merging $MAIN_BRANCH into $BRANCH."
+  echo "[parallel-agent-finish] Reconciling child branch: git rebase $MAIN_BRANCH"
+  if ! git rebase "$MAIN_BRANCH"; then
+    echo "[parallel-agent-finish] Conflict while rebasing $BRANCH onto $MAIN_BRANCH."
     exit 2
   fi
 
@@ -953,7 +991,7 @@ while true; do
     cd "$PARENT_ROOT" || exit 1
     git checkout "$MAIN_BRANCH" >/dev/null 2>&1 || exit 1
     sleep 2
-    git merge --no-edit "$BRANCH"
+    git merge --ff-only "$BRANCH"
   )
   merge_status=$?
   set -e
@@ -961,17 +999,13 @@ while true; do
   release_lock
 
   if [[ "$merge_status" -eq 0 ]]; then
-    echo "[parallel-agent-finish] Success: merged $BRANCH -> $MAIN_BRANCH in parent checkout."
+    echo "[parallel-agent-finish] Success: fast-forwarded $MAIN_BRANCH to include $BRANCH in parent checkout."
     rm -f "$(pwd)/.pi/active.lock" || true
     exit 0
   fi
 
-  echo "[parallel-agent-finish] Parent merge failed (likely $MAIN_BRANCH moved)."
-  echo "[parallel-agent-finish] Aborting parent merge and retrying reconcile loop..."
-  (
-    cd "$PARENT_ROOT" || exit 1
-    git merge --abort >/dev/null 2>&1 || true
-  )
+  echo "[parallel-agent-finish] Parent fast-forward failed (likely $MAIN_BRANCH moved)."
+  echo "[parallel-agent-finish] Retrying rebase reconcile loop..."
 
   sleep 1
 done

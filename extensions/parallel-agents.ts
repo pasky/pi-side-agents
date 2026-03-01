@@ -15,6 +15,8 @@ const ENV_RUNTIME_DIR = "PI_PARALLEL_RUNTIME_DIR";
 const STATUS_KEY = "parallel-agents";
 const REGISTRY_VERSION = 1;
 const CHILD_LINK_ENTRY_TYPE = "parallel-agent-link";
+const STATUS_UPDATE_MESSAGE_TYPE = "parallel-agent-status";
+const PROMPT_UPDATE_MESSAGE_TYPE = "parallel-agent-prompt";
 
 const SUMMARY_SYSTEM_PROMPT = `You are writing a handoff summary for a background coding agent.
 
@@ -93,6 +95,7 @@ type AllocateWorktreeResult = {
 
 type StartAgentParams = {
 	task: string;
+	branchHint?: string;
 	model?: string;
 	includeSummary: boolean;
 };
@@ -104,6 +107,7 @@ type StartAgentResult = {
 	worktreePath: string;
 	branch: string;
 	warnings: string[];
+	prompt: string;
 };
 
 type ExitMarker = {
@@ -119,9 +123,24 @@ type CommandResult = {
 	error?: string;
 };
 
+type StatusTransitionNotice = {
+	id: string;
+	fromStatus: AgentStatus;
+	toStatus: AgentStatus;
+	tmuxWindowIndex?: number;
+};
+
+type AgentStatusSnapshot = {
+	status: AgentStatus;
+	tmuxWindowIndex?: number;
+};
+
 let statusPollTimer: NodeJS.Timeout | undefined;
 let statusPollContext: ExtensionContext | undefined;
+let statusPollApi: ExtensionAPI | undefined;
 let statusPollInFlight = false;
+const statusSnapshotsByStateRoot = new Map<string, Map<string, AgentStatusSnapshot>>();
+let lastRenderedStatusLine: string | undefined;
 
 function nowIso() {
 	return new Date().toISOString();
@@ -151,7 +170,7 @@ function isTerminalStatus(status: AgentStatus): boolean {
 	return status === "done" || status === "failed" || status === "crashed";
 }
 
-const STATUS_TRANSITION_PREFIX = "[parallel-agent][status]";
+const PROMPT_LOG_PREFIX = "[parallel-agent][prompt]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
@@ -165,43 +184,38 @@ function resolveBacklogPathForRecord(stateRoot: string, record: AgentRecord): st
 	return join(getRuntimeDir(stateRoot, record.id), "backlog.log");
 }
 
-async function appendStatusTransitionToBacklog(
+async function appendKickoffPromptToBacklog(
 	stateRoot: string,
 	record: AgentRecord,
-	fromStatus: AgentStatus,
-	toStatus: AgentStatus,
-	changedAt: string,
+	prompt: string,
+	loggedAt = nowIso(),
 ): Promise<void> {
-	if (fromStatus === toStatus) return;
-
 	const backlogPath = resolveBacklogPathForRecord(stateRoot, record);
-	const line = `${STATUS_TRANSITION_PREFIX} ${changedAt} ${record.id}: ${fromStatus} -> ${toStatus}\n`;
+	const promptLines = prompt.replace(/\r\n?/g, "\n").split("\n");
+	const body = promptLines
+		.map((line) => `${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: ${line}`)
+		.join("\n");
+	const payload =
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt begin\n` +
+		`${body}\n` +
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt end\n`;
 
 	try {
 		await ensureDir(dirname(backlogPath));
-		await fs.appendFile(backlogPath, line, "utf8");
+		await fs.appendFile(backlogPath, payload, "utf8");
 		record.logPath = record.logPath ?? backlogPath;
 		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
 	} catch {
-		// Best effort only; status updates must not fail if backlog append fails.
+		// Best effort only; prompt logging must not block agent startup.
 	}
 }
 
-async function setRecordStatus(
-	stateRoot: string,
-	record: AgentRecord,
-	nextStatus: AgentStatus,
-	options?: { logTransition?: boolean },
-): Promise<boolean> {
+async function setRecordStatus(_stateRoot: string, record: AgentRecord, nextStatus: AgentStatus): Promise<boolean> {
 	const previousStatus = record.status;
 	if (previousStatus === nextStatus) return false;
 
-	const changedAt = nowIso();
 	record.status = nextStatus;
-	record.updatedAt = changedAt;
-	if (options?.logTransition ?? true) {
-		await appendStatusTransitionToBacklog(stateRoot, record, previousStatus, nextStatus, changedAt);
-	}
+	record.updatedAt = nowIso();
 	return true;
 }
 
@@ -229,6 +243,30 @@ function statusShort(status: AgentStatus): string {
 			return "fail";
 		case "crashed":
 			return "crash";
+	}
+}
+
+function statusColorRole(status: AgentStatus): "warning" | "muted" | "accent" | "error" {
+	switch (status) {
+		// Rare/transient states: highlight so they stand out.
+		case "allocating_worktree":
+		case "spawning_tmux":
+		case "starting":
+		case "waiting_merge_lock":
+		case "retrying_reconcile":
+			return "warning";
+		// Normal working states: keep low visual weight.
+		case "running":
+		case "finishing":
+		case "done":
+			return "muted";
+		// Needs user attention.
+		case "waiting_user":
+			return "accent";
+		// Terminal failure.
+		case "failed":
+		case "crashed":
+			return "error";
 	}
 }
 
@@ -466,49 +504,104 @@ async function mutateRegistry(stateRoot: string, mutator: (registry: RegistryFil
 	});
 }
 
-function parseAgentOrdinal(raw: string): number | undefined {
-	const match = raw.match(/^a-(\d+)$/);
-	if (!match) return undefined;
-	const parsed = Number(match[1]);
-	if (!Number.isFinite(parsed)) return undefined;
-	return parsed;
+/** Sanitize a raw string into a kebab-case slug suitable for branch names and agent IDs. */
+function sanitizeSlug(raw: string): string {
+	return raw
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.split("-")
+		.filter(Boolean)
+		.slice(0, 3)
+		.join("-");
 }
 
-function maxAgentOrdinalInRegistry(registry: RegistryFile): number {
-	let max = 0;
-	for (const id of Object.keys(registry.agents)) {
-		const parsed = parseAgentOrdinal(id);
-		if (parsed === undefined) continue;
-		max = Math.max(max, parsed);
+/** Turn a task description into a slug by taking the first 3 meaningful words. */
+function slugFromTask(task: string): string {
+	const stopWords = new Set(["a", "an", "the", "to", "in", "on", "at", "of", "for", "and", "or", "is", "it", "be", "do", "with"]);
+	const words = task
+		.replace(/[^a-zA-Z0-9\s]/g, " ")
+		.split(/\s+/)
+		.map((w) => w.toLowerCase())
+		.filter((w) => w.length > 0 && !stopWords.has(w));
+	const slug = words.slice(0, 3).join("-");
+	return slug || "agent";
+}
+
+/** Generate a slug via LLM, falling back to heuristic extraction from task text. */
+async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug: string; warning?: string }> {
+	if (!ctx.model) {
+		return { slug: slugFromTask(task), warning: "No model available for slug generation; used heuristic fallback." };
 	}
-	return max;
+
+	try {
+		const userMessage: Message = {
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: task,
+				},
+			],
+			timestamp: Date.now(),
+		};
+
+		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		const response = await complete(
+			ctx.model,
+			{
+				systemPrompt:
+					"Generate a 2-3 word kebab-case slug summarizing the given task. Reply with ONLY the slug, nothing else. Examples: fix-auth-leak, add-retry-logic, update-readme",
+				messages: [userMessage],
+			},
+			{ apiKey, maxTokens: 30 },
+		);
+
+		const raw = response.content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.join("")
+			.trim();
+
+		const slug = sanitizeSlug(raw);
+		if (slug) return { slug };
+
+		return { slug: slugFromTask(task), warning: "LLM returned empty slug; used heuristic fallback." };
+	} catch (err) {
+		return {
+			slug: slugFromTask(task),
+			warning: `Slug generation failed: ${stringifyError(err)}. Used heuristic fallback.`,
+		};
+	}
 }
 
-function maxAgentOrdinalInCheckedOutParallelBranches(repoRoot: string): number {
+/** Collect all agent IDs currently known in the registry or checked out as parallel-agent branches. */
+function existingAgentIds(registry: RegistryFile, repoRoot: string): Set<string> {
+	const ids = new Set<string>(Object.keys(registry.agents));
+
 	const listed = run("git", ["-C", repoRoot, "worktree", "list", "--porcelain"]);
-	if (!listed.ok) return 0;
-
-	let max = 0;
-	for (const line of listed.stdout.split(/\r?\n/)) {
-		if (!line.startsWith("branch ")) continue;
-		const branchRef = line.slice("branch ".length).trim();
-		if (!branchRef || branchRef === "(detached)") continue;
-		const branch = branchRef.startsWith("refs/heads/") ? branchRef.slice("refs/heads/".length) : branchRef;
-		const match = branch.match(/^parallel-agent\/(a-\d+)$/);
-		if (!match) continue;
-		const parsed = parseAgentOrdinal(match[1]);
-		if (parsed === undefined) continue;
-		max = Math.max(max, parsed);
+	if (listed.ok) {
+		for (const line of listed.stdout.split(/\r?\n/)) {
+			if (!line.startsWith("branch ")) continue;
+			const branchRef = line.slice("branch ".length).trim();
+			if (!branchRef || branchRef === "(detached)") continue;
+			const branch = branchRef.startsWith("refs/heads/") ? branchRef.slice("refs/heads/".length) : branchRef;
+			if (branch.startsWith("parallel-agent/")) {
+				ids.add(branch.slice("parallel-agent/".length));
+			}
+		}
 	}
 
-	return max;
+	return ids;
 }
 
-function nextAgentId(registry: RegistryFile, repoRoot: string): string {
-	const maxRegistry = maxAgentOrdinalInRegistry(registry);
-	const maxCheckedOut = maxAgentOrdinalInCheckedOutParallelBranches(repoRoot);
-	const next = Math.max(maxRegistry, maxCheckedOut) + 1;
-	return `a-${String(next).padStart(4, "0")}`;
+/** Deduplicate a slug against existing IDs by appending -2, -3, etc. */
+function deduplicateSlug(slug: string, existing: Set<string>): string {
+	if (!existing.has(slug)) return slug;
+	for (let i = 2; ; i++) {
+		const candidate = `${slug}-${i}`;
+		if (!existing.has(candidate)) return candidate;
+	}
 }
 
 async function writeWorktreeLock(worktreePath: string, payload: Record<string, unknown>): Promise<void> {
@@ -781,10 +874,19 @@ async function allocateWorktree(options: {
 	const chosenRegistered = registered.has(resolve(chosenPath));
 
 	if (chosenRegistered) {
+		// Remember old branch so we can try to clean it up after switching away.
+		const oldBranchResult = run("git", ["-C", chosenPath, "branch", "--show-current"]);
+		const oldBranch = oldBranchResult.ok ? oldBranchResult.stdout.trim() : "";
+
 		run("git", ["-C", chosenPath, "merge", "--abort"]);
 		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
 		runOrThrow("git", ["-C", chosenPath, "clean", "-fd"]);
 		runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
+
+		// Best-effort cleanup: delete old branch if fully merged (-d, not -D).
+		if (oldBranch && oldBranch !== branch) {
+			run("git", ["-C", repoRoot, "branch", "-d", oldBranch]);
+		}
 	} else {
 		if (await fileExists(chosenPath)) {
 			const entries = await fs.readdir(chosenPath).catch(() => []);
@@ -1261,8 +1363,19 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 	try {
 		await ensureDir(getMetaDir(stateRoot));
 
+		let slug: string;
+		if (params.branchHint) {
+			slug = sanitizeSlug(params.branchHint);
+			if (!slug) slug = slugFromTask(params.task);
+		} else {
+			const generated = await generateSlug(ctx, params.task);
+			slug = generated.slug;
+			if (generated.warning) aggregatedWarnings.push(generated.warning);
+		}
+
 		await mutateRegistry(stateRoot, async (registry) => {
-			agentId = nextAgentId(registry, repoRoot);
+			const existing = existingAgentIds(registry, repoRoot);
+			agentId = deduplicateSlug(slug, existing);
 			registry.agents[agentId] = {
 				id: agentId,
 				parentSessionId,
@@ -1309,6 +1422,29 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
 
 		await atomicWrite(promptPath, kickoff.prompt + "\n");
+		try {
+			await mutateRegistry(stateRoot, async (registry) => {
+				const record = registry.agents[agentId];
+				if (!record) return;
+				await appendKickoffPromptToBacklog(stateRoot, record, kickoff.prompt);
+			});
+		} catch {
+			// Best effort fallback when registry lock/update fails; write directly
+			// to the known backlog path without requiring registry mutation.
+			await appendKickoffPromptToBacklog(
+				stateRoot,
+				{
+					id: agentId,
+					task: params.task,
+					status: "spawning_tmux",
+					startedAt: now,
+					updatedAt: nowIso(),
+					runtimeDir,
+					logPath,
+				},
+				kickoff.prompt,
+			);
+		}
 
 		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
 		const modelSpec = resolvedModel.modelSpec;
@@ -1361,14 +1497,18 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.warnings = [...(record.warnings ?? []), ...aggregatedWarnings];
 		});
 
-		return {
+		const started: StartAgentResult = {
 			id: agentId,
 			tmuxWindowId: windowId,
 			tmuxWindowIndex: windowIndex,
 			worktreePath: worktree.worktreePath,
 			branch: worktree.branch,
 			warnings: aggregatedWarnings,
+			prompt: kickoff.prompt,
 		};
+		emitKickoffPromptMessage(pi, started);
+
+		return started;
 	} catch (err) {
 		if (spawnedWindowId) {
 			run("tmux", ["kill-window", "-t", spawnedWindowId]);
@@ -1494,7 +1634,7 @@ async function setChildRuntimeStatus(ctx: ExtensionContext, nextStatus: AgentSta
 			return;
 		}
 
-		const changed = await setRecordStatus(stateRoot, record, nextStatus, { logTransition: false });
+		const changed = await setRecordStatus(stateRoot, record, nextStatus);
 		if (!changed) {
 			record.updatedAt = nowIso();
 		}
@@ -1596,7 +1736,7 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 		existing.parentSessionId = existing.parentSessionId ?? parentSession;
 		let statusChanged = false;
 		if (!isTerminalStatus(existing.status)) {
-			statusChanged = await setRecordStatus(stateRoot, existing, "running", { logTransition: false });
+			statusChanged = await setRecordStatus(stateRoot, existing, "running");
 		}
 		if (!statusChanged) {
 			existing.updatedAt = nowIso();
@@ -1626,37 +1766,155 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 	}
 }
 
-async function renderStatusLine(ctx: ExtensionContext): Promise<void> {
+function isChildRuntime(): boolean {
+	return Boolean(process.env[ENV_AGENT_ID]);
+}
+
+function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): StatusTransitionNotice[] {
+	const previous = statusSnapshotsByStateRoot.get(stateRoot);
+	const next = new Map<string, AgentStatusSnapshot>();
+	const transitions: StatusTransitionNotice[] = [];
+
+	for (const record of agents) {
+		const currentSnapshot: AgentStatusSnapshot = {
+			status: record.status,
+			tmuxWindowIndex: record.tmuxWindowIndex,
+		};
+		next.set(record.id, currentSnapshot);
+
+		const previousSnapshot = previous?.get(record.id);
+		if (!previousSnapshot || previousSnapshot.status === record.status) continue;
+		transitions.push({
+			id: record.id,
+			fromStatus: previousSnapshot.status,
+			toStatus: record.status,
+			tmuxWindowIndex: record.tmuxWindowIndex ?? previousSnapshot.tmuxWindowIndex,
+		});
+	}
+
+	if (previous) {
+		for (const [agentId, previousSnapshot] of previous.entries()) {
+			if (next.has(agentId)) continue;
+			if (isTerminalStatus(previousSnapshot.status)) continue;
+			transitions.push({
+				id: agentId,
+				fromStatus: previousSnapshot.status,
+				toStatus: "done",
+				tmuxWindowIndex: previousSnapshot.tmuxWindowIndex,
+			});
+		}
+	}
+
+	statusSnapshotsByStateRoot.set(stateRoot, next);
+	if (!previous) return [];
+	return transitions.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function formatStatusTransitionMessage(transition: StatusTransitionNotice): string {
+	const win = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex})` : "";
+	return `parallel-agent ${transition.id}: ${transition.fromStatus} -> ${transition.toStatus}${win}`;
+}
+
+function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transitions: StatusTransitionNotice[]): void {
+	if (isChildRuntime()) return;
+
+	for (const transition of transitions) {
+		const message = formatStatusTransitionMessage(transition);
+		pi.sendMessage(
+			{
+				customType: STATUS_UPDATE_MESSAGE_TYPE,
+				content: message,
+				display: true,
+				details: {
+					agentId: transition.id,
+					fromStatus: transition.fromStatus,
+					toStatus: transition.toStatus,
+					tmuxWindowIndex: transition.tmuxWindowIndex,
+					emittedAt: Date.now(),
+				},
+			},
+			{
+				triggerTurn: false,
+				deliverAs: "followUp",
+			},
+		);
+
+		if (ctx.hasUI && (transition.toStatus === "failed" || transition.toStatus === "crashed")) {
+			ctx.ui.notify(message, "error");
+		}
+	}
+}
+
+function emitKickoffPromptMessage(pi: ExtensionAPI, started: StartAgentResult): void {
+	const win = started.tmuxWindowIndex !== undefined ? ` (tmux #${started.tmuxWindowIndex})` : "";
+	const content = `parallel-agent ${started.id}: kickoff prompt${win}\n\n${started.prompt}`;
+	pi.sendMessage(
+		{
+			customType: PROMPT_UPDATE_MESSAGE_TYPE,
+			content,
+			display: false,
+			details: {
+				agentId: started.id,
+				tmuxWindowId: started.tmuxWindowId,
+				tmuxWindowIndex: started.tmuxWindowIndex,
+				worktreePath: started.worktreePath,
+				branch: started.branch,
+				prompt: started.prompt,
+				emittedAt: Date.now(),
+			},
+		},
+		{ triggerTurn: false },
+	);
+}
+
+async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options?: { emitTransitions?: boolean }): Promise<void> {
 	if (!ctx.hasUI) return;
 
 	const stateRoot = getStateRoot(ctx);
 	const refreshed = await refreshAllAgents(stateRoot);
 	const agents = Object.values(refreshed.agents).sort((a, b) => a.id.localeCompare(b.id));
 
+	if (options?.emitTransitions ?? true) {
+		const transitions = collectStatusTransitions(stateRoot, agents);
+		if (transitions.length > 0) {
+			emitStatusTransitions(pi, ctx, transitions);
+		}
+	} else if (!statusSnapshotsByStateRoot.has(stateRoot)) {
+		collectStatusTransitions(stateRoot, agents);
+	}
+
 	if (agents.length === 0) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		if (lastRenderedStatusLine !== undefined) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			lastRenderedStatusLine = undefined;
+		}
 		return;
 	}
 
+	const theme = ctx.ui.theme;
 	const line = agents
 		.map((record) => {
 			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
-			return `${record.id}:${statusShort(record.status)}${win}`;
+			const entry = `${record.id}:${statusShort(record.status)}${win}`;
+			return theme.fg(statusColorRole(record.status), entry);
 		})
 		.join(" ");
 
+	if (line === lastRenderedStatusLine) return;
 	ctx.ui.setStatus(STATUS_KEY, line);
+	lastRenderedStatusLine = line;
 }
 
-function ensureStatusPoller(ctx: ExtensionContext): void {
+function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	statusPollContext = ctx;
+	statusPollApi = pi;
 	if (!ctx.hasUI) return;
 
 	if (!statusPollTimer) {
 		statusPollTimer = setInterval(() => {
-			if (statusPollInFlight || !statusPollContext) return;
+			if (statusPollInFlight || !statusPollContext || !statusPollApi) return;
 			statusPollInFlight = true;
-			void renderStatusLine(statusPollContext)
+			void renderStatusLine(statusPollApi, statusPollContext)
 				.catch(() => {})
 				.finally(() => {
 					statusPollInFlight = false;
@@ -1665,7 +1923,7 @@ function ensureStatusPoller(ctx: ExtensionContext): void {
 		statusPollTimer.unref();
 	}
 
-	void renderStatusLine(ctx).catch(() => {});
+	void renderStatusLine(pi, ctx).catch(() => {});
 }
 
 
@@ -1695,8 +1953,12 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 				for (const warning of started.warnings) {
 					lines.push(`warning: ${warning}`);
 				}
+				lines.push("", "prompt:");
+				for (const line of started.prompt.split(/\r?\n/)) {
+					lines.push(`  ${line}`);
+				}
 				renderInfoMessage(pi, ctx, "parallel-agent started", lines);
-				await renderStatusLine(ctx).catch(() => {});
+				await renderStatusLine(pi, ctx).catch(() => {});
 			} catch (err) {
 				ctx.hasUI && ctx.ui.notify(`Failed to start agent: ${stringifyError(err)}`, "error");
 			}
@@ -1723,7 +1985,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			if (records.length === 0) {
 				lines.push("(no tracked agents)");
 			} else {
-				for (const record of records) {
+				for (const [index, record] of records.entries()) {
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
 					lines.push(
@@ -1733,6 +1995,9 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 					if (record.error) lines.push(`  error: ${record.error}`);
 					if (record.status === "failed" || record.status === "crashed") {
 						failedIds.push(record.id);
+					}
+					if (index < records.length - 1) {
+						lines.push("");
 					}
 				}
 			}
@@ -1808,15 +2073,17 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background parallel child agent in tmux/worktree. Lifecycle: child should implement the change, then yield for review (do not auto-/quit); parent/user inspects, asks child to wrap up (finish flow), then quits. The description is sent verbatim (no automatic context summary), so include all necessary context. Returns { ok: true, id, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background parallel child agent in tmux/worktree. Lifecycle: child should implement the change, then yield for review (do not auto-/quit); parent/user inspects, asks child to wrap up (finish flow), then quits. The description is sent verbatim (no automatic context summary), so include all necessary context. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Returns { ok: true, id, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
+			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
 			model: Type.Optional(Type.String({ description: "Model as provider/modelId (optional)" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				const started = await startAgent(pi, ctx, {
 					task: params.description,
+					branchHint: params.branchHint,
 					model: params.model,
 					includeSummary: false,
 				});
@@ -1922,12 +2189,12 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(ctx);
+		ensureStatusPoller(pi, ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(ctx);
+		ensureStatusPoller(pi, ctx);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -1940,6 +2207,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		statusPollContext = ctx;
-		await renderStatusLine(ctx).catch(() => {});
+		statusPollApi = pi;
+		await renderStatusLine(pi, ctx, { emitTransitions: false }).catch(() => {});
 	});
 }

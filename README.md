@@ -13,6 +13,7 @@ Keep your main coding flow unblocked by offloading side quests (questions, hotfi
 - Worktree lock diagnostics (warn on locked worktrees not tracked in registry)
 - Shared registry at `.pi/parallel-agents/registry.json`
 - Statusline summary of active agents in project sessions
+- Parent-side agent state-change feed as append-only `parallel-agent-status` messages in session history (plus error toasts for failed/crashed transitions)
 - Agent control tools (tool-only; no `/agent-check` or `/agent-send` slash commands):
   - `agent-start`
   - `agent-check`
@@ -20,7 +21,7 @@ Keep your main coding flow unblocked by offloading side quests (questions, hotfi
   - `agent-send`
 - Supporting command:
   - `/agents` (lists agents, optionally cleans failed/crashed registry entries, and now offers interactive orphan `.pi/active.lock` reclaim)
-- **`agent-setup` skill** — interactive setup via `/skill:agent-setup` (interviews you about merge policy, main branch, bootstrap hooks, then writes `.pi/parallel-agent-*.sh` and the child finish skill)
+- **`agent-setup` skill** — interactive setup via `/skill:agent-setup` (interviews you about finish policy, main branch, bootstrap hooks, then writes `.pi/parallel-agent-*.sh` and the child finish skill)
 
 ## Status
 
@@ -86,7 +87,7 @@ After review, parent/user asks the child to wrap up (finish flow), then quits it
 
 Inspect the current status and recent output of an agent.
 
-`agent.task` is a compact preview; `backlog` is ANSI-stripped + truncated for safe LLM context usage, and includes synthetic `[parallel-agent][status] ... old -> new` notices for parent-observed lifecycle transitions.
+`agent.task` is a compact preview; `backlog` is ANSI-stripped + truncated for safe LLM context usage, and includes synthetic `[parallel-agent][prompt] ...` kickoff-prompt lines written by the parent.
 
 **Input**: `{ "id": "a-0001" }`
 
@@ -231,7 +232,7 @@ Prerequisites:
 
 ## Next steps
 
-1. Harden finalize/merge loop conflict UX in child guidance.
+1. Harden finalize/rebase loop conflict UX in child guidance.
 2. Improve runtime status fidelity (`thinking`/`tool`/`pending` detail) from child sessions.
 3. Add optional PR flow to finish skill/script.
 4. Add CI strategy for gated/manual integration test runs.
