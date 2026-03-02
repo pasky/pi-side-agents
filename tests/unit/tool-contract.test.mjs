@@ -29,16 +29,25 @@ function isTerminalStatus(status) {
 	return status === "done" || status === "failed" || status === "crashed";
 }
 
+const BACKLOG_SEPARATOR_RE = /^[-─—_=]{5,}$/u;
+
+function isBacklogSeparatorLine(line) {
+	return BACKLOG_SEPARATOR_RE.test(line.trim());
+}
+
+function splitLines(text) {
+	return text
+		.split(/\r?\n/)
+		.filter((line, i, arr) => !(i === arr.length - 1 && line.length === 0));
+}
+
 /**
  * @param {string} text
  * @param {number} count
  * @returns {string[]}
  */
 function tailLines(text, count) {
-	const lines = text
-		.split(/\r?\n/)
-		.filter((line, i, arr) => !(i === arr.length - 1 && line.length === 0));
-	return lines.slice(-count);
+	return splitLines(text).slice(-count);
 }
 
 function stripTerminalNoise(text) {
@@ -61,6 +70,25 @@ function summarizeTask(task, maxChars = 220) {
 	return truncateWithEllipsis(collapsed, maxChars);
 }
 
+function collectRecentBacklogLines(lines, minimumLines) {
+	if (minimumLines <= 0) return [];
+
+	const selected = [];
+	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		const cleaned = stripTerminalNoise(lines[i]).trimEnd();
+		if (cleaned.length === 0) continue;
+		if (isBacklogSeparatorLine(cleaned)) continue;
+		selected.push(lines[i]);
+		if (selected.length >= minimumLines) break;
+	}
+
+	return selected.reverse();
+}
+
+function selectBacklogTailLines(text, minimumLines) {
+	return collectRecentBacklogLines(splitLines(text), minimumLines);
+}
+
 function sanitizeBacklogLines(lines, lineMax = 240, totalMax = 2400) {
 	const out = [];
 	let remaining = totalMax;
@@ -69,6 +97,7 @@ function sanitizeBacklogLines(lines, lineMax = 240, totalMax = 2400) {
 		if (remaining <= 0) break;
 		const cleaned = stripTerminalNoise(raw).trimEnd();
 		if (cleaned.length === 0) continue;
+		if (isBacklogSeparatorLine(cleaned)) continue;
 
 		const line = truncateWithEllipsis(cleaned, lineMax);
 		if (line.length <= remaining) {
@@ -261,6 +290,48 @@ test("tailLines — requesting more lines than exist returns all", () => {
 
 test("tailLines — empty string returns empty array", () => {
 	assert.deepEqual(tailLines("", 5), []);
+});
+
+test("selectBacklogTailLines — returns at least requested non-separator tail lines when available", () => {
+	const text = [
+		"line 01",
+		"line 02",
+		"line 03",
+		"line 04",
+		"line 05",
+		"line 06",
+		"line 07",
+		"line 08",
+		"line 09",
+		"line 10",
+		"line 11",
+		"line 12",
+		"-----------",
+		"────────────",
+		"  --------  ",
+		"",
+		"           ",
+	].join("\n");
+
+	const selected = selectBacklogTailLines(text, 10);
+	assert.equal(selected.length, 10, `expected 10 selected lines, got ${selected.length}`);
+	assert.deepEqual(selected, [
+		"line 03",
+		"line 04",
+		"line 05",
+		"line 06",
+		"line 07",
+		"line 08",
+		"line 09",
+		"line 10",
+		"line 11",
+		"line 12",
+	]);
+});
+
+test("sanitizeBacklogLines — filters divider-only lines but keeps regular dash text", () => {
+	const cleaned = sanitizeBacklogLines(["ok", "-----------", "────────────", "step - with context"]);
+	assert.deepEqual(cleaned, ["ok", "step - with context"]);
 });
 
 test("sanitizeBacklogLines — strips ANSI/control sequences and truncates lines", () => {

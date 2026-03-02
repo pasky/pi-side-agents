@@ -180,6 +180,8 @@ const PROMPT_LOG_PREFIX = "[side-agent][prompt]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
+const TMUX_BACKLOG_CAPTURE_LINES = 300;
+const BACKLOG_SEPARATOR_RE = /^[-─—_=]{5,}$/u;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -292,6 +294,35 @@ function summarizeTask(task: string): string {
 	return truncateWithEllipsis(collapsed, TASK_PREVIEW_MAX_CHARS);
 }
 
+function isBacklogSeparatorLine(line: string): boolean {
+	return BACKLOG_SEPARATOR_RE.test(line.trim());
+}
+
+function splitLines(text: string): string[] {
+	return text
+		.split(/\r?\n/)
+		.filter((line, i, arr) => !(i === arr.length - 1 && line.length === 0));
+}
+
+function collectRecentBacklogLines(lines: string[], minimumLines: number): string[] {
+	if (minimumLines <= 0) return [];
+
+	const selected: string[] = [];
+	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		const cleaned = stripTerminalNoise(lines[i]).trimEnd();
+		if (cleaned.length === 0) continue;
+		if (isBacklogSeparatorLine(cleaned)) continue;
+		selected.push(lines[i]);
+		if (selected.length >= minimumLines) break;
+	}
+
+	return selected.reverse();
+}
+
+function selectBacklogTailLines(text: string, minimumLines: number): string[] {
+	return collectRecentBacklogLines(splitLines(text), minimumLines);
+}
+
 function sanitizeBacklogLines(lines: string[]): string[] {
 	const out: string[] = [];
 	let remaining = BACKLOG_TOTAL_MAX_CHARS;
@@ -300,6 +331,7 @@ function sanitizeBacklogLines(lines: string[]): string[] {
 		if (remaining <= 0) break;
 		const cleaned = stripTerminalNoise(raw).trimEnd();
 		if (cleaned.length === 0) continue;
+		if (isBacklogSeparatorLine(cleaned)) continue;
 
 		const line = truncateWithEllipsis(cleaned, BACKLOG_LINE_MAX_CHARS);
 		if (line.length <= remaining) {
@@ -341,10 +373,7 @@ function normalizeWaitStates(input?: string[]): { values: AgentStatus[]; error?:
 }
 
 function tailLines(text: string, count: number): string[] {
-	const lines = text
-		.split(/\r?\n/)
-		.filter((line, i, arr) => !(i === arr.length - 1 && line.length === 0));
-	return lines.slice(-count);
+	return splitLines(text).slice(-count);
 }
 
 function run(command: string, args: string[], options?: { cwd?: string; input?: string }): CommandResult {
@@ -1187,7 +1216,7 @@ function tmuxSendPrompt(windowId: string, prompt: string): void {
 }
 
 function tmuxCaptureTail(windowId: string, lines = 10): string[] {
-	const captured = run("tmux", ["capture-pane", "-p", "-t", windowId, "-S", "-300"]);
+	const captured = run("tmux", ["capture-pane", "-p", "-t", windowId, "-S", `-${TMUX_BACKLOG_CAPTURE_LINES}`]);
 	if (!captured.ok) return [];
 	return tailLines(captured.stdout, lines);
 }
@@ -1273,7 +1302,7 @@ async function getBacklogTail(record: AgentRecord, lines = 10): Promise<string[]
 	if (record.logPath && (await fileExists(record.logPath))) {
 		try {
 			const raw = await fs.readFile(record.logPath, "utf8");
-			const tailed = sanitizeBacklogLines(tailLines(raw, lines));
+			const tailed = sanitizeBacklogLines(selectBacklogTailLines(raw, lines));
 			if (tailed.length > 0) return tailed;
 		} catch {
 			// fall through
@@ -1281,7 +1310,8 @@ async function getBacklogTail(record: AgentRecord, lines = 10): Promise<string[]
 	}
 
 	if (record.tmuxWindowId && tmuxWindowExists(record.tmuxWindowId)) {
-		return sanitizeBacklogLines(tmuxCaptureTail(record.tmuxWindowId, lines));
+		const captured = tmuxCaptureTail(record.tmuxWindowId, TMUX_BACKLOG_CAPTURE_LINES);
+		return sanitizeBacklogLines(collectRecentBacklogLines(captured, lines));
 	}
 
 	return [];
