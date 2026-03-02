@@ -833,17 +833,32 @@ test(
 	async (t) => {
 		if (!assertAuthOrSkip(t)) return;
 
-		const harness = await createHarness(t, { staleRuntimeDirForId: "a-0001" });
-		const runtimeDir = join(harness.repoRoot, ".pi", "side-agents", "runtime", "a-0001");
+		const branchHint = "runtime-archive-regression";
+		const harness = await createHarness(t, { staleRuntimeDirForId: branchHint });
+		const runtimeDir = join(harness.repoRoot, ".pi", "side-agents", "runtime", branchHint);
 		const staleExitPath = join(runtimeDir, "exit.json");
-		const staleMarker = "stale-runtime-marker-a-0001";
+		const staleMarker = `stale-runtime-marker-${branchHint}`;
 
 		assert.equal(await exists(staleExitPath), true, "fixture should create stale exit.json before launch");
 
-		await sendParentCommand(harness, `/agent -model ${MODEL_SPEC} runtime archive regression`);
-		await waitForSpawnedAgent(harness, "a-0001", 180_000);
+		const startResult = await callToolViaPrompt(
+			harness,
+			"agent-start",
+			{
+				description: "runtime archive regression",
+				branchHint,
+				model: MODEL_SPEC,
+			},
+			{ timeoutMs: 120_000, retries: 3 },
+		);
+		const started = startResult.payload;
+		assert.equal(started.ok, true, `agent-start should succeed: ${JSON.stringify(started)}`);
+		assert.equal(started.id, branchHint, `expected deterministic id from branchHint, got: ${JSON.stringify(started)}`);
+		const agentId = started.id;
 
-		const runningCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
+		await waitForSpawnedAgent(harness, agentId, 180_000);
+
+		const runningCheck = await callAgentCheckTool(harness, agentId, 60_000);
 		assert.equal(
 			runningCheck.payload.ok,
 			true,
@@ -851,9 +866,9 @@ test(
 		);
 		assert.equal(await exists(staleExitPath), false, "fresh runtime dir should not carry stale exit.json into new run");
 
-		const archiveBase = join(harness.repoRoot, ".pi", "side-agents", "runtime-archive", "a-0001");
+		const archiveBase = join(harness.repoRoot, ".pi", "side-agents", "runtime-archive", branchHint);
 		const archivedDir = await waitFor(
-			"archived runtime dir for a-0001",
+			`archived runtime dir for ${branchHint}`,
 			async () => {
 				if (!(await exists(archiveBase))) return false;
 				const entries = await readdir(archiveBase, { withFileTypes: true });
@@ -873,11 +888,11 @@ test(
 		);
 		assert.equal(await exists(join(archivedDir, "exit.json")), true, "archived runtime should preserve stale exit marker");
 
-		await waitForChildPiBooted(harness, "a-0001", 120_000);
-		const quitSend = await callAgentSendTool(harness, "a-0001", "!/quit", 60_000);
+		await waitForChildPiBooted(harness, agentId, 120_000);
+		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
-		await waitForAgent(harness, "a-0001", { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, "a-0001");
+		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 180_000 });
+		await closeChildWindowAfterPrompt(harness, agentId);
 	},
 );
 
