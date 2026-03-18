@@ -16,7 +16,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const PROJECT_ROOT = resolve(process.cwd());
@@ -123,6 +123,21 @@ async function hasOpenAiCodexAuth() {
 	}
 }
 
+async function findExecutableInPath(commandName) {
+	const pathValue = process.env.PATH ?? "";
+	for (const segment of pathValue.split(delimiter)) {
+		if (!segment) continue;
+		const candidate = join(segment, commandName);
+		try {
+			await access(candidate, fsConstants.X_OK);
+			return candidate;
+		} catch {
+			// continue search
+		}
+	}
+	return "";
+}
+
 async function ensureLoginShellPiCommand() {
 	const localBinDir = join(homedir(), ".local", "bin");
 	const localPi = join(localBinDir, "pi");
@@ -131,7 +146,7 @@ async function ensureLoginShellPiCommand() {
 	}
 
 	await mkdir(localBinDir, { recursive: true });
-	const piPath = run("which", ["pi"]).stdout.trim();
+	const piPath = await findExecutableInPath("pi");
 	if (!piPath) {
 		throw new Error("Could not find pi executable in PATH");
 	}
@@ -1044,7 +1059,10 @@ set -euo pipefail
 PARENT_ROOT="\${PI_SIDE_PARENT_REPO:-\${1:-}}"
 AGENT_ID="\${PI_SIDE_AGENT_ID:-\${2:-unknown}}"
 MAIN_BRANCH="main"
-BRANCH="$(git branch --show-current)"
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [[ "$BRANCH" == "HEAD" ]]; then
+  BRANCH=""
+fi
 
 if [[ -z "$PARENT_ROOT" ]]; then
   echo "[side-agent-finish] Missing parent checkout path."
@@ -1062,9 +1080,13 @@ mkdir -p "$LOCK_DIR"
 
 MERGE_LOCK_TIMEOUT=120
 
+iso_now() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 acquire_lock() {
   local payload started elapsed
-  payload="{\"agentId\":\"$AGENT_ID\",\"pid\":$$,\"acquiredAt\":\"$(date -Is)\"}"
+  payload="{\"agentId\":\"$AGENT_ID\",\"pid\":$$,\"acquiredAt\":\"$(iso_now)\"}"
   started=$(date +%s)
   while true; do
     if ( set -o noclobber; printf '%s\\n' "$payload" > "$LOCK_FILE" ) 2>/dev/null; then
