@@ -731,9 +731,21 @@ async function updateWorktreeLock(worktreePath: string, patch: Record<string, un
 	await writeWorktreeLock(worktreePath, { ...current, ...patch });
 }
 
-async function cleanupWorktreeLockBestEffort(worktreePath?: string): Promise<void> {
+async function cleanupWorktreeLockBestEffort(worktreePath?: string, agentId?: string): Promise<void> {
 	if (!worktreePath) return;
 	const lockPath = join(worktreePath, ".pi", "active.lock");
+	// If an agentId is provided, verify the lock actually belongs to this agent
+	// before deleting — another agent may have since claimed the same worktree.
+	if (agentId) {
+		try {
+			const lock = await readJsonFile<Record<string, unknown>>(lockPath);
+			if (lock && typeof lock.agentId === "string" && lock.agentId !== agentId) {
+				return;
+			}
+		} catch {
+			// If we can't read the lock, proceed with deletion attempt
+		}
+	}
 	await fs.unlink(lockPath).catch(() => {});
 }
 
@@ -942,16 +954,33 @@ async function allocateWorktree(options: {
 	let chosen: WorktreeSlot | undefined;
 	let maxIndex = 0;
 
+	// Build a set of worktree paths claimed by active (non-terminal) agents in the registry,
+	// so we can reject slots even if the lock file was inadvertently cleaned up.
+	const claimedByActiveAgent = new Set<string>();
+	for (const record of Object.values(registry.agents)) {
+		if (record.id !== agentId && record.worktreePath && !isTerminalStatus(record.status)) {
+			claimedByActiveAgent.add(resolve(record.worktreePath));
+		}
+	}
+
 	for (const slot of slots) {
 		maxIndex = Math.max(maxIndex, slot.index);
+		const resolvedSlotPath = resolve(slot.path);
 		const lockPath = join(slot.path, ".pi", "active.lock");
 
+		// Check 1: lock file on disk.
 		if (await fileExists(lockPath)) {
 			const lock = await readJsonFile<Record<string, unknown>>(lockPath);
 			const lockAgentId = typeof lock?.agentId === "string" ? lock.agentId : undefined;
 			if (!lockAgentId || !registry.agents[lockAgentId]) {
 				warnings.push(`Locked worktree is not tracked in registry: ${slot.path}`);
 			}
+			continue;
+		}
+
+		// Check 2: registry claims this worktree for an active agent (even if lock is missing).
+		if (claimedByActiveAgent.has(resolvedSlotPath)) {
+			warnings.push(`Worktree claimed by active agent in registry (missing lock): ${slot.path}`);
 			continue;
 		}
 
@@ -1269,7 +1298,7 @@ type RefreshRuntimeResult = {
 
 async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): Promise<RefreshRuntimeResult> {
 	if (record.status === "done") {
-		await cleanupWorktreeLockBestEffort(record.worktreePath);
+		await cleanupWorktreeLockBestEffort(record.worktreePath, record.id);
 		return { removeFromRegistry: true };
 	}
 
@@ -1285,7 +1314,7 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 			if (exit.exitCode === 0) {
 				// Only release worktree lock for successful agents; failed agents
 				// keep it so the workspace is not reused until explicitly cleared.
-				await cleanupWorktreeLockBestEffort(record.worktreePath);
+				await cleanupWorktreeLockBestEffort(record.worktreePath, record.id);
 				return { removeFromRegistry: true };
 			}
 			return { removeFromRegistry: false };
@@ -2176,18 +2205,18 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					`Remove ${failedIds.length} failed/crashed agent(s) from registry: ${failedIds.join(", ")}`,
 				);
 				if (confirmed) {
-					// Collect worktree paths before removing records so we can release their locks.
-					const worktreePaths: string[] = [];
+					// Collect worktree paths + agent IDs before removing records so we can release their locks.
+					const worktreeEntries: { path: string; agentId: string }[] = [];
 					registry = await mutateRegistry(stateRoot, async (next) => {
 						for (const id of failedIds) {
 							const rec = next.agents[id];
-							if (rec?.worktreePath) worktreePaths.push(rec.worktreePath);
+							if (rec?.worktreePath) worktreeEntries.push({ path: rec.worktreePath, agentId: id });
 							delete next.agents[id];
 						}
 					});
 					// Release worktree locks now that the agents are cleared.
-					for (const wt of worktreePaths) {
-						await cleanupWorktreeLockBestEffort(wt);
+					for (const entry of worktreeEntries) {
+						await cleanupWorktreeLockBestEffort(entry.path, entry.agentId);
 					}
 					ctx.ui.notify(`Removed ${failedIds.length} agent(s): ${failedIds.join(", ")}`, "info");
 				}
