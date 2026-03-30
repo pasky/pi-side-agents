@@ -1282,8 +1282,10 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 			if (!changed) {
 				record.updatedAt = nowIso();
 			}
-			await cleanupWorktreeLockBestEffort(record.worktreePath);
 			if (exit.exitCode === 0) {
+				// Only release worktree lock for successful agents; failed agents
+				// keep it so the workspace is not reused until explicitly cleared.
+				await cleanupWorktreeLockBestEffort(record.worktreePath);
 				return { removeFromRegistry: true };
 			}
 			return { removeFromRegistry: false };
@@ -1308,7 +1310,8 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 		if (!record.error) {
 			record.error = "tmux window disappeared before an exit marker was recorded";
 		}
-		await cleanupWorktreeLockBestEffort(record.worktreePath);
+		// Do NOT release worktree lock for crashed agents; the workspace
+		// is blocked from reuse until the agent is explicitly cleared.
 	}
 
 	return { removeFromRegistry: false };
@@ -2173,11 +2176,19 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					`Remove ${failedIds.length} failed/crashed agent(s) from registry: ${failedIds.join(", ")}`,
 				);
 				if (confirmed) {
+					// Collect worktree paths before removing records so we can release their locks.
+					const worktreePaths: string[] = [];
 					registry = await mutateRegistry(stateRoot, async (next) => {
 						for (const id of failedIds) {
+							const rec = next.agents[id];
+							if (rec?.worktreePath) worktreePaths.push(rec.worktreePath);
 							delete next.agents[id];
 						}
 					});
+					// Release worktree locks now that the agents are cleared.
+					for (const wt of worktreePaths) {
+						await cleanupWorktreeLockBestEffort(wt);
+					}
 					ctx.ui.notify(`Removed ${failedIds.length} agent(s): ${failedIds.join(", ")}`, "info");
 				}
 			}
