@@ -661,7 +661,10 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 			timestamp: Date.now(),
 		};
 
-		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) {
+			return { slug: slugFromTask(task), warning: `Slug generation auth failed: ${auth.error}. Used heuristic fallback.` };
+		}
 		const response = await complete(
 			ctx.model,
 			{
@@ -669,7 +672,7 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 					"Generate a 2-3 word kebab-case slug summarizing the given task. Reply with ONLY the slug, nothing else. Examples: fix-auth-leak, add-retry-logic, update-readme",
 				messages: [userMessage],
 			},
-			{ apiKey, maxTokens: 30 },
+			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 30 },
 		);
 
 		const raw = response.content
@@ -1091,11 +1094,12 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 			timestamp: Date.now(),
 		};
 
-		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) throw new Error(`Auth failed for summary generation: ${auth.error}`);
 		const response = await complete(
 			ctx.model,
 			{ systemPrompt: SUMMARY_SYSTEM_PROMPT, messages: [userMessage] },
-			{ apiKey },
+			{ apiKey: auth.apiKey, headers: auth.headers },
 		);
 
 		const summary = normalizeGeneratedSummary(
@@ -1556,7 +1560,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;
-		aggregatedWarnings = [...worktree.warnings];
+		aggregatedWarnings.push(...worktree.warnings);
 
 		const runtimePrep = await prepareFreshRuntimeDir(stateRoot, agentId);
 		const runtimeDir = runtimePrep.runtimeDir;
