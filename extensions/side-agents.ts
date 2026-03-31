@@ -433,6 +433,14 @@ function resolveGitRoot(cwd: string): string {
 	return resolve(cwd);
 }
 
+function getCurrentBranch(cwd: string): string {
+	const result = run("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
+	if (!result.ok) return "";
+	const branch = result.stdout.trim();
+	if (!branch || branch === "HEAD") return "";
+	return branch;
+}
+
 function getStateRoot(ctx: ExtensionContext): string {
 	const fromEnv = process.env[ENV_STATE_ROOT];
 	if (fromEnv) return resolve(fromEnv);
@@ -1022,8 +1030,7 @@ async function allocateWorktree(options: {
 
 	if (chosenRegistered) {
 		// Remember old branch so we can try to clean it up after switching away.
-		const oldBranchResult = run("git", ["-C", chosenPath, "branch", "--show-current"]);
-		const oldBranch = oldBranchResult.ok ? oldBranchResult.stdout.trim() : "";
+		const oldBranch = getCurrentBranch(chosenPath);
 
 		run("git", ["-C", chosenPath, "merge", "--abort"]);
 		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
@@ -1166,9 +1173,13 @@ export ${ENV_PARENT_REPO}=\"$PARENT_REPO\"
 export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
 
+iso_now() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 write_exit() {
   local code="$1"
-  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(date -Is)" > "$EXIT_FILE"
+  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(iso_now)" > "$EXIT_FILE"
 }
 
 cd "$WORKTREE"
