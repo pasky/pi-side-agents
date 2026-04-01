@@ -21,6 +21,14 @@ The most advanced users of AI coding agents have worked like this for a while, b
 - New skill `agent-setup` to scaffold project-specific lifecycle scripts (flexible worktree initialization and merge process).
 - Exposes orchestration _tools_ for parent agents: `agent-start`, `agent-check`, `agent-wait-any`, `agent-send`
 
+## Install
+
+```bash
+pi install npm:pi-side-agents
+```
+
+This registers the extension and skill with Pi. Restart Pi after installing.
+
 ## Quick start
 
 <p align="center">
