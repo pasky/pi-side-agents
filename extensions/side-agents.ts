@@ -1187,7 +1187,7 @@ cd "$WORKTREE"
 
 if [[ -x "$START_SCRIPT" ]]; then
   set +e
-  "$START_SCRIPT" "$PARENT_REPO" "$WORKTREE" "$AGENT_ID"
+  source "$START_SCRIPT" "$PARENT_REPO" "$WORKTREE" "$AGENT_ID"
   start_exit=$?
   set -e
   if [[ "$start_exit" -ne 0 ]]; then
