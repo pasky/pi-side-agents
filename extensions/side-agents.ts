@@ -1424,31 +1424,80 @@ function renderInfoMessage(pi: ExtensionAPI, ctx: ExtensionContext, title: strin
 	}
 }
 
-/** Resolve a pi-amplike mode name to a model spec by reading the global modes.json file. */
-async function resolveModeToModelSpec(modeName: string): Promise<{ modelSpec?: string; warning?: string }> {
+type ModeFileSpec = { provider?: string; modelId?: string; thinkingLevel?: string };
+type ParsedModesFile = { currentMode?: string; modes?: Record<string, ModeFileSpec> };
+
+/** Read and parse modes.json, checking project-level first, then global. */
+async function readModesFile(cwd: string): Promise<{ parsed: ParsedModesFile; path: string } | undefined> {
 	const homedir = os.homedir();
 	const agentDir = process.env.PI_CODING_AGENT_DIR
 		? resolve(process.env.PI_CODING_AGENT_DIR.replace(/^~/, homedir))
 		: join(homedir, ".pi", "agent");
-	const modesPath = join(agentDir, "modes.json");
 
-	try {
-		const raw = await fs.readFile(modesPath, "utf8");
-		const parsed = JSON.parse(raw) as { modes?: Record<string, { provider?: string; modelId?: string; thinkingLevel?: string }> };
-		if (!parsed.modes || !parsed.modes[modeName]) {
-			return { warning: `Mode '${modeName}' not found in ${modesPath}` };
+	const candidates = [
+		join(cwd, ".pi", "modes.json"),
+		join(agentDir, "modes.json"),
+	];
+
+	for (const modesPath of candidates) {
+		try {
+			const raw = await fs.readFile(modesPath, "utf8");
+			const parsed = JSON.parse(raw) as ParsedModesFile;
+			if (parsed.modes && typeof parsed.modes === "object" && Object.keys(parsed.modes).length > 0) {
+				return { parsed, path: modesPath };
+			}
+		} catch {
+			continue;
 		}
-		const spec = parsed.modes[modeName];
-		if (!spec.provider || !spec.modelId) {
-			return { warning: `Mode '${modeName}' has no provider/modelId in ${modesPath}` };
-		}
-		const modelSpec = spec.thinkingLevel
-			? `${spec.provider}/${spec.modelId}:${spec.thinkingLevel}`
-			: `${spec.provider}/${spec.modelId}`;
-		return { modelSpec };
-	} catch {
-		return { warning: `Could not read modes from ${modesPath}` };
 	}
+	return undefined;
+}
+
+function modeSpecToModelSpec(spec: ModeFileSpec): string | undefined {
+	if (!spec.provider || !spec.modelId) return undefined;
+	return spec.thinkingLevel
+		? `${spec.provider}/${spec.modelId}:${spec.thinkingLevel}`
+		: `${spec.provider}/${spec.modelId}`;
+}
+
+/** Resolve a pi-amplike mode name to a model spec by reading modes.json. */
+async function resolveModeToModelSpec(cwd: string, modeName: string): Promise<{ modelSpec?: string; warning?: string }> {
+	const file = await readModesFile(cwd);
+	if (!file) return { warning: "Could not read modes.json" };
+	if (!file.parsed.modes?.[modeName]) {
+		return { warning: `Mode '${modeName}' not found in ${file.path}` };
+	}
+	const modelSpec = modeSpecToModelSpec(file.parsed.modes[modeName]);
+	if (!modelSpec) {
+		return { warning: `Mode '${modeName}' has no provider/modelId in ${file.path}` };
+	}
+	return { modelSpec };
+}
+
+/**
+ * Infer the current mode name by matching the active model+thinking level
+ * against modes.json definitions. Returns the mode's full model spec if found.
+ */
+async function inferCurrentModeModelSpec(
+	cwd: string,
+	ctx: ExtensionContext,
+	thinkingLevel: string,
+): Promise<string | undefined> {
+	if (!ctx.model) return undefined;
+	const file = await readModesFile(cwd);
+	if (!file?.parsed.modes) return undefined;
+
+	const provider = ctx.model.provider;
+	const modelId = ctx.model.id;
+
+	for (const spec of Object.values(file.parsed.modes)) {
+		if (spec.provider === provider && spec.modelId === modelId &&
+			(spec.thinkingLevel ?? undefined) === (thinkingLevel || undefined)) {
+			return modeSpecToModelSpec(spec);
+		}
+	}
+
+	return undefined;
 }
 
 function parseAgentCommandArgs(raw: string): { task: string; model?: string; mode?: string } {
@@ -1498,9 +1547,15 @@ function withThinking(modelSpec: string, thinking?: string): string {
 async function resolveModelSpecForChild(
 	ctx: ExtensionContext,
 	requested?: string,
+	thinkingLevel?: string,
 ): Promise<{ modelSpec?: string; warning?: string }> {
 	const currentModelSpec = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	if (!requested || requested.trim().length === 0) {
+		// Try to inherit the full mode (model + thinking level) from modes.json
+		if (thinkingLevel !== undefined) {
+			const modeSpec = await inferCurrentModeModelSpec(ctx.cwd, ctx, thinkingLevel);
+			if (modeSpec) return { modelSpec: modeSpec };
+		}
 		return { modelSpec: currentModelSpec };
 	}
 
@@ -1665,7 +1720,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			);
 		}
 
-		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
+		const resolvedModel = await resolveModelSpecForChild(ctx, params.model, pi.getThinkingLevel());
 		const modelSpec = resolvedModel.modelSpec;
 		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
@@ -2171,7 +2226,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			// Resolve -mode (pi-amplike modes) to a model spec if no explicit -model was given.
 			let resolvedModel = parsed.model;
 			if (parsed.mode && !parsed.model) {
-				const modeResult = await resolveModeToModelSpec(parsed.mode);
+				const modeResult = await resolveModeToModelSpec(ctx.cwd, parsed.mode);
 				if (modeResult.modelSpec) {
 					resolvedModel = modeResult.modelSpec;
 				} else if (modeResult.warning) {
