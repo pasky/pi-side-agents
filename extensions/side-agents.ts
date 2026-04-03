@@ -2442,11 +2442,6 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		ensureStatusPoller(pi, ctx);
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
-		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(pi, ctx);
-	});
-
 	pi.on("agent_start", async (_event, ctx) => {
 		await setChildRuntimeStatus(ctx, "running").catch(() => {});
 	});

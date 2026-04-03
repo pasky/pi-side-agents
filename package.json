@@ -37,7 +37,7 @@
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-coding-agent": "^0.65.0",
     "@sinclair/typebox": "*"
   }
 }
