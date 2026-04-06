@@ -1378,6 +1378,8 @@ async function refreshAgent(stateRoot: string, agentId: string): Promise<AgentRe
 }
 
 async function refreshAllAgents(stateRoot: string): Promise<RegistryFile> {
+	// Don't create the meta dir just to discover there are no agents.
+	if (!(await fileExists(getMetaDir(stateRoot)))) return emptyRegistry();
 	return mutateRegistry(stateRoot, async (registry) => {
 		for (const [agentId, record] of Object.entries(registry.agents)) {
 			const refreshed = await refreshOneAgentRuntime(stateRoot, record);
