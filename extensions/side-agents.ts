@@ -1282,6 +1282,23 @@ function tmuxSendLine(windowId: string, line: string): void {
 	runOrThrow("tmux", ["send-keys", "-t", windowId, line, "C-m"]);
 }
 
+/** Wait for a shell prompt to appear in a newly created tmux window. */
+async function tmuxWaitForShellReady(windowId: string, timeoutMs = 5000): Promise<void> {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		const captured = run("tmux", ["capture-pane", "-p", "-t", windowId]);
+		if (captured.ok) {
+			const lines = captured.stdout.split(/\r?\n/).filter((l) => l.trim().length > 0);
+			// Look for a typical shell prompt ending in $, #, %, or >
+			if (lines.some((l) => /[\$#%>]\s*$/.test(l))) {
+				return;
+			}
+		}
+		await sleep(50);
+	}
+	// Timed out — proceed anyway rather than failing the whole agent start.
+}
+
 function tmuxInterrupt(windowId: string): void {
 	run("tmux", ["send-keys", "-t", windowId, "C-c"]);
 }
@@ -1751,6 +1768,10 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		await fs.chmod(launchScriptPath, 0o755);
 
 		tmuxPipePaneToFile(windowId, logPath);
+		// Wait for the shell in the new tmux window to be ready before sending
+		// commands — otherwise the keystrokes arrive before bash has initialised
+		// and are silently lost (displayed as text but never executed).
+		await tmuxWaitForShellReady(windowId);
 		// Run cd in the interactive pane shell first so Ctrl+Z in child Pi drops
 		// back to the child worktree prompt (not the parent worktree).
 		tmuxSendLine(windowId, `cd ${shellQuote(worktree.worktreePath)}`);
