@@ -1,7 +1,7 @@
 import { complete, type Message } from "@mariozechner/pi-ai";
 import { convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
