@@ -255,7 +255,7 @@ description: Rebase the branch with current work onto upstream and fast-forward 
 
 When the user explicitly approves the work (e.g. says "LGTM", "ship it", "merge it"):
 
-1. **Confirm** the finish action with the user before doing anything.
+1. Make sure the user's intent is clear (you received an explicit "merge" instruction) before doing anything.
 
 2. Run the finish script:
 
