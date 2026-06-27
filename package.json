@@ -36,8 +36,8 @@
     "test:integration": "node --test --test-concurrency=1 tests/integration/side-agents.integration.test.mjs"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "^0.80.0",
     "typebox": "*"
   }
 }
