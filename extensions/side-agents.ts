@@ -1,6 +1,7 @@
 import { complete, type Message } from "@earendil-works/pi-ai";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -2403,6 +2404,22 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	type ToolTheme = { fg(color: string, text: string): string; bold(text: string): string };
+
+	function renderToolTitle(theme: ToolTheme, title: string, accent?: string): string {
+		let out = theme.fg("toolTitle", theme.bold(title + " "));
+		if (accent) out += theme.fg("accent", accent + " ");
+		return out;
+	}
+
+	function renderMultilineArg(theme: ToolTheme, text: string, maxLines = 6): string {
+		const lines = text.split("\n");
+		const shown = lines.length > maxLines
+			? lines.slice(0, maxLines).join("\n") + "\n" + theme.fg("dim", `… (${lines.length - maxLines} more lines)`)
+			: text;
+		return theme.fg("muted", shown);
+	}
+
 	pi.registerTool({
 		name: "agent-start",
 		label: "Agent Start",
@@ -2448,6 +2465,12 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				};
 			}
 		},
+		renderCall(args, theme) {
+			let out = renderToolTitle(theme, "Agent Start", args.branchHint);
+			if (args.model) out += theme.fg("dim", `[${args.model}] `);
+			out += renderMultilineArg(theme, args.description);
+			return new Text(out, 0, 0);
+		},
 	});
 
 	pi.registerTool({
@@ -2469,6 +2492,9 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					content: [{ type: "text", text: JSON.stringify({ ok: false, error: stringifyError(err) }, null, 2) }],
 				};
 			}
+		},
+		renderCall(args, theme) {
+			return new Text(renderToolTitle(theme, "Agent Check", args.id), 0, 0);
 		},
 	});
 
@@ -2492,6 +2518,9 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				};
 			}
 		},
+		renderCall(args, theme) {
+			return new Text(renderToolTitle(theme, "Agent Wait", args.ids.join(", ")), 0, 0);
+		},
 	});
 
 	pi.registerTool({
@@ -2514,6 +2543,10 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					content: [{ type: "text", text: JSON.stringify({ ok: false, error: stringifyError(err) }, null, 2) }],
 				};
 			}
+		},
+		renderCall(args, theme) {
+			const out = renderToolTitle(theme, "Agent Send", args.id) + renderMultilineArg(theme, args.prompt, 8);
+			return new Text(out, 0, 0);
 		},
 	});
 
