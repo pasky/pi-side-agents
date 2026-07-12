@@ -2408,15 +2408,18 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 	function renderToolTitle(theme: ToolTheme, title: string, accent?: string): string {
 		let out = theme.fg("toolTitle", theme.bold(title + " "));
-		if (accent) out += theme.fg("accent", accent + " ");
+		// Args may be partial while streaming and may contain terminal escapes;
+		// strip noise before writing them to the terminal.
+		if (accent) out += theme.fg("accent", stripTerminalNoise(accent) + " ");
 		return out;
 	}
 
-	function renderMultilineArg(theme: ToolTheme, text: string, maxLines = 6): string {
-		const lines = text.split("\n");
+	function renderMultilineArg(theme: ToolTheme, text: string | undefined, maxLines = 6): string {
+		const clean = truncateWithEllipsis(stripTerminalNoise(text ?? ""), 2000);
+		const lines = clean.split("\n");
 		const shown = lines.length > maxLines
 			? lines.slice(0, maxLines).join("\n") + "\n" + theme.fg("dim", `… (${lines.length - maxLines} more lines)`)
-			: text;
+			: clean;
 		return theme.fg("muted", shown);
 	}
 
@@ -2467,7 +2470,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			let out = renderToolTitle(theme, "Agent Start", args.branchHint);
-			if (args.model) out += theme.fg("dim", `[${args.model}] `);
+			if (args.model) out += theme.fg("dim", `[${stripTerminalNoise(args.model)}] `);
 			out += renderMultilineArg(theme, args.description);
 			return new Text(out, 0, 0);
 		},
@@ -2519,7 +2522,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(renderToolTitle(theme, "Agent Wait", args.ids.join(", ")), 0, 0);
+			return new Text(renderToolTitle(theme, "Agent Wait", Array.isArray(args.ids) ? args.ids.join(", ") : undefined), 0, 0);
 		},
 	});
 
