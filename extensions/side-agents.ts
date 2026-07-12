@@ -1308,7 +1308,9 @@ function tmuxSendPrompt(windowId: string, prompt: string): void {
 	if (!loaded.ok) {
 		throw new Error(`Failed to send input to tmux window ${windowId}: ${loaded.stderr || loaded.error || "unknown error"}`);
 	}
-	runOrThrow("tmux", ["paste-buffer", "-d", "-t", windowId]);
+	// -p wraps the paste in bracketed-paste escapes so the child TUI inserts
+	// newlines into its editor instead of submitting each line separately.
+	runOrThrow("tmux", ["paste-buffer", "-d", "-p", "-t", windowId]);
 	runOrThrow("tmux", ["send-keys", "-t", windowId, "C-m"]);
 }
 
