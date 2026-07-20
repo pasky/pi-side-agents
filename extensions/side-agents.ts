@@ -1,4 +1,4 @@
-import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai";
+import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai/compat";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -678,6 +678,8 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 		// Disable thinking for this trivial task. Models that cannot turn thinking off
 		// (e.g. forced adaptive thinking, thinkingLevelMap.off === null) get minimal
 		// effort instead — hence the generous maxTokens headroom for thinking blocks.
+		// (Some providers ignore the effort hint; the heuristic fallback below covers
+		// any case where the budget is still exhausted before text is emitted.)
 		const supportsOff = !ctx.model.reasoning || getSupportedThinkingLevels(ctx.model).includes("off");
 		const response = await completeSimple(
 			ctx.model,
@@ -689,7 +691,7 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 			{
 				apiKey: auth.apiKey,
 				headers: auth.headers,
-				maxTokens: 1500,
+				maxTokens: supportsOff ? 100 : 1500,
 				reasoning: supportsOff ? undefined : "minimal",
 			},
 		);
