@@ -682,7 +682,8 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 					"Generate a 2-3 word kebab-case slug summarizing the given task. Reply with ONLY the slug, nothing else. Examples: fix-auth-leak, add-retry-logic, update-readme",
 				messages: [userMessage],
 			},
-			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 30 },
+			// Generous budget: reasoning models spend tokens on thinking blocks before emitting text.
+			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 1500 },
 		);
 
 		const raw = response.content
