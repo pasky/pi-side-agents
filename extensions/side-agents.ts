@@ -1,4 +1,4 @@
-import { complete, type Message } from "@earendil-works/pi-ai";
+import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -675,15 +675,23 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 		if (!auth.ok) {
 			return { slug: slugFromTask(task), warning: `Slug generation auth failed: ${auth.error}. Used heuristic fallback.` };
 		}
-		const response = await complete(
+		// Disable thinking for this trivial task. Models that cannot turn thinking off
+		// (e.g. forced adaptive thinking, thinkingLevelMap.off === null) get minimal
+		// effort instead — hence the generous maxTokens headroom for thinking blocks.
+		const supportsOff = !ctx.model.reasoning || getSupportedThinkingLevels(ctx.model).includes("off");
+		const response = await completeSimple(
 			ctx.model,
 			{
 				systemPrompt:
 					"Generate a 2-3 word kebab-case slug summarizing the given task. Reply with ONLY the slug, nothing else. Examples: fix-auth-leak, add-retry-logic, update-readme",
 				messages: [userMessage],
 			},
-			// Generous budget: reasoning models spend tokens on thinking blocks before emitting text.
-			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 1500 },
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				maxTokens: 1500,
+				reasoning: supportsOff ? undefined : "minimal",
+			},
 		);
 
 		const raw = response.content
