@@ -1,5 +1,7 @@
 # pi-side-agents
 
+[GitHub repository](https://github.com/pasky/pi-side-agents) · [npm package](https://www.npmjs.com/package/pi-side-agents)
+
 **Code in sprints** (using agents *asynchronously*), **not in a marathon** (*sequential* task-by-task flow).
 
 Instead of waiting for one backlog item to finish before starting the next, spin tasks out into single-use child agents as soon as they occur to you. Each child runs in its own **tmux window** and **git worktree**, so you can keep shipping in parallel while maintaining isolation and control (asynchronous does not mean autonomous). Each child is a one-off and lives and dies with its short topic branch and tmux window—no "teams of long-running agents messaging each other" or "role-based subagents" complexity. The workflow is unified, simple, and deterministic.
