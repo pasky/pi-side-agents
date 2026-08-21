@@ -1046,6 +1046,11 @@ async function allocateWorktree(options: {
 		const oldBranch = getCurrentBranch(chosenPath);
 
 		run("git", ["-C", chosenPath, "merge", "--abort"]);
+		// Detach HEAD before resetting: reset --hard with the old branch still
+		// checked out would move the old branch ref to mainHead, orphaning any
+		// unmerged commits and letting the `branch -d` below silently delete a
+		// branch the README promises survives /quit.
+		runOrThrow("git", ["-C", chosenPath, "checkout", "--detach"]);
 		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
 		runOrThrow("git", ["-C", chosenPath, "clean", "-fd"]);
 		runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
