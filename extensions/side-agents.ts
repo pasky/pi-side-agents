@@ -1,6 +1,6 @@
 import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai/compat";
-import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, serializeConversation, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionInfo } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
@@ -94,6 +94,15 @@ type StartAgentParams = {
 	branchHint?: string;
 	model?: string;
 	includeSummary: boolean;
+	/** Resume a previously quit child session instead of starting fresh. */
+	resume?: {
+		/** Path to the pi session file to resume (passed to `pi --session`). */
+		sessionPath: string;
+		/** Original agent id from the session's side-agent-link entry, if known. */
+		agentIdHint?: string;
+		/** Optional extra prompt to send on resume; empty = just reopen the session. */
+		prompt?: string;
+	};
 };
 
 type StartAgentResult = {
@@ -773,6 +782,23 @@ async function cleanupWorktreeLockBestEffort(worktreePath?: string, agentId?: st
 	await fs.unlink(lockPath).catch(() => {});
 }
 
+/** Find the worktree path that currently has the given branch checked out, if any. */
+function findWorktreeForBranch(repoRoot: string, branch: string): string | undefined {
+	const result = run("git", ["-C", repoRoot, "worktree", "list", "--porcelain"]);
+	if (!result.ok) return undefined;
+	let currentPath: string | undefined;
+	for (const line of result.stdout.split(/\r?\n/)) {
+		if (line.startsWith("worktree ")) {
+			currentPath = line.slice("worktree ".length).trim();
+		} else if (line.startsWith("branch ")) {
+			const ref = line.slice("branch ".length).trim();
+			const name = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+			if (name === branch && currentPath) return resolve(currentPath);
+		}
+	}
+	return undefined;
+}
+
 function listRegisteredWorktrees(repoRoot: string): Set<string> {
 	const result = runOrThrow("git", ["-C", repoRoot, "worktree", "list", "--porcelain"]);
 	const set = new Set<string>();
@@ -964,11 +990,13 @@ async function allocateWorktree(options: {
 	stateRoot: string;
 	agentId: string;
 	parentSessionId?: string;
+	/** Resume mode: check out this pre-existing branch instead of creating side-agent/<id> from HEAD. */
+	existingBranch?: string;
 }): Promise<AllocateWorktreeResult> {
-	const { repoRoot, stateRoot, agentId, parentSessionId } = options;
+	const { repoRoot, stateRoot, agentId, parentSessionId, existingBranch } = options;
 
 	const warnings: string[] = [];
-	const branch = `side-agent/${agentId}`;
+	const branch = existingBranch ?? `side-agent/${agentId}`;
 	const mainHead = runOrThrow("git", ["-C", repoRoot, "rev-parse", "HEAD"]).stdout.trim();
 
 	const registry = await loadRegistry(stateRoot);
@@ -987,8 +1015,40 @@ async function allocateWorktree(options: {
 		}
 	}
 
+	// Resume mode: if the branch still exists and is still checked out in one of
+	// our slots, prefer resuming in place — this preserves the working tree
+	// exactly (including any uncommitted state left behind at /quit).
+	let resumeBranchExists = false;
+	let resumeInPlace = false;
+	if (existingBranch) {
+		resumeBranchExists = run("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok;
+		if (!resumeBranchExists) {
+			warnings.push(`Branch ${branch} no longer exists (pruned as fully merged); recreating it from current HEAD.`);
+		} else {
+			const holder = findWorktreeForBranch(repoRoot, branch);
+			if (holder) {
+				if (holder === resolve(repoRoot)) {
+					throw new Error(`Branch ${branch} is checked out in the main worktree; cannot resume it in a side-agent slot`);
+				}
+				const slot = slots.find((s) => resolve(s.path) === holder);
+				if (!slot) {
+					throw new Error(`Branch ${branch} is checked out at ${holder}, which is not a side-agent worktree slot`);
+				}
+				if (await fileExists(join(slot.path, ".pi", "active.lock"))) {
+					throw new Error(`Worktree ${slot.path} holding branch ${branch} is locked by another agent`);
+				}
+				if (claimedByActiveAgent.has(resolve(slot.path))) {
+					throw new Error(`Worktree ${slot.path} holding branch ${branch} is claimed by an active agent`);
+				}
+				chosen = slot;
+				resumeInPlace = true;
+			}
+		}
+	}
+
 	for (const slot of slots) {
 		maxIndex = Math.max(maxIndex, slot.index);
+		if (chosen) continue;
 		const resolvedSlotPath = resolve(slot.path);
 		const lockPath = join(slot.path, ".pi", "active.lock");
 
@@ -1028,7 +1088,6 @@ async function allocateWorktree(options: {
 		}
 
 		chosen = slot;
-		break;
 	}
 
 	if (!chosen) {
@@ -1041,7 +1100,10 @@ async function allocateWorktree(options: {
 	const chosenPath = chosen.path;
 	const chosenRegistered = registered.has(resolve(chosenPath));
 
-	if (chosenRegistered) {
+	if (resumeInPlace) {
+		// The worktree still has the resumed branch checked out; leave the working
+		// tree untouched (it may carry uncommitted state from before the /quit).
+	} else if (chosenRegistered) {
 		// Remember old branch so we can try to clean it up after switching away.
 		const oldBranch = getCurrentBranch(chosenPath);
 
@@ -1053,7 +1115,11 @@ async function allocateWorktree(options: {
 		runOrThrow("git", ["-C", chosenPath, "checkout", "--detach"]);
 		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
 		runOrThrow("git", ["-C", chosenPath, "clean", "-fd"]);
-		runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
+		if (existingBranch && resumeBranchExists) {
+			runOrThrow("git", ["-C", chosenPath, "checkout", branch]);
+		} else {
+			runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
+		}
 
 		// Best-effort cleanup: delete old branch if fully merged (-d, not -D).
 		if (oldBranch && oldBranch !== branch) {
@@ -1067,7 +1133,11 @@ async function allocateWorktree(options: {
 			}
 		}
 		await ensureDir(dirname(chosenPath));
-		runOrThrow("git", ["-C", repoRoot, "worktree", "add", "-B", branch, chosenPath, mainHead]);
+		if (existingBranch && resumeBranchExists) {
+			runOrThrow("git", ["-C", repoRoot, "worktree", "add", chosenPath, branch]);
+		} else {
+			runOrThrow("git", ["-C", repoRoot, "worktree", "add", "-B", branch, chosenPath, mainHead]);
+		}
 	}
 
 	await ensureDir(join(chosenPath, ".pi"));
@@ -1168,6 +1238,8 @@ function buildLaunchScript(params: {
 	exitFile: string;
 	modelSpec?: string;
 	runtimeDir: string;
+	/** Resume mode: pi session file to reopen via --session. */
+	sessionPath?: string;
 }): string {
 	return `#!/usr/bin/env bash
 set -euo pipefail
@@ -1181,6 +1253,7 @@ WINDOW_ID=${shellQuote(params.tmuxWindowId)}
 PROMPT_FILE=${shellQuote(params.promptPath)}
 EXIT_FILE=${shellQuote(params.exitFile)}
 MODEL_SPEC=${shellQuote(params.modelSpec ?? "")}
+SESSION_FILE=${shellQuote(params.sessionPath ?? "")}
 RUNTIME_DIR=${shellQuote(params.runtimeDir)}
 START_SCRIPT=\"$WORKTREE/.pi/side-agent-start.sh\"
 CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
@@ -1234,13 +1307,20 @@ PI_CMD=(pi)
 if [[ -n "$MODEL_SPEC" ]]; then
   PI_CMD+=(--model "$MODEL_SPEC")
 fi
+if [[ -n "$SESSION_FILE" ]]; then
+  PI_CMD+=(--session "$SESSION_FILE")
+fi
 if [[ -d "$CHILD_SKILLS_DIR" ]]; then
   # agent-setup writes the child-only finish skill here; load it explicitly.
   PI_CMD+=(--skill "$CHILD_SKILLS_DIR")
 fi
 
 set +e
-"\${PI_CMD[@]}" "$(cat "$PROMPT_FILE")"
+if [[ -s "$PROMPT_FILE" ]]; then
+  "\${PI_CMD[@]}" "$(cat "$PROMPT_FILE")"
+else
+  "\${PI_CMD[@]}"
+fi
 exit_code=$?
 set -e
 
@@ -1667,6 +1747,97 @@ async function resolveModelSpecForChild(
 	return { modelSpec: trimmed };
 }
 
+const MAX_RESUME_CANDIDATES = 20;
+
+type ResumableSession = {
+	info: SessionInfo;
+	agentId?: string;
+	branch?: string;
+	branchExists: boolean;
+};
+
+/** Extract the original agent id from a child session's side-agent-link entry. */
+async function readSessionAgentId(sessionPath: string): Promise<string | undefined> {
+	try {
+		const raw = await fs.readFile(sessionPath, "utf8");
+		for (const line of raw.split("\n")) {
+			if (!line.includes(CHILD_LINK_ENTRY_TYPE)) continue;
+			try {
+				const entry = JSON.parse(line) as { customType?: string; data?: { agentId?: unknown } };
+				if (entry?.customType === CHILD_LINK_ENTRY_TYPE && typeof entry.data?.agentId === "string") {
+					return entry.data.agentId;
+				}
+			} catch {
+				// skip unparsable lines
+			}
+		}
+	} catch {
+		// unreadable session file
+	}
+	return undefined;
+}
+
+/**
+ * List resumable child sessions: pi's own session registry filtered down to
+ * this repo's side-agent worktree slots, minus sessions of currently tracked
+ * (live) agents, newest first.
+ */
+async function listResumableSessions(stateRoot: string, repoRoot: string): Promise<ResumableSession[]> {
+	const registry = await refreshAllAgents(stateRoot);
+	const activeSessionPaths = new Set<string>();
+	for (const record of Object.values(registry.agents)) {
+		if (record.childSessionId) activeSessionPaths.add(resolve(record.childSessionId));
+	}
+
+	const slots = await listWorktreeSlots(repoRoot);
+	const infos: SessionInfo[] = [];
+	for (const slot of slots) {
+		try {
+			infos.push(...(await SessionManager.list(slot.path)));
+		} catch {
+			// slot without sessions (or unreadable session dir)
+		}
+	}
+	infos.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+
+	const out: ResumableSession[] = [];
+	for (const info of infos) {
+		if (out.length >= MAX_RESUME_CANDIDATES) break;
+		if (activeSessionPaths.has(resolve(info.path))) continue;
+		if (info.messageCount === 0) continue;
+		const agentId = await readSessionAgentId(info.path);
+		const branch = agentId ? `side-agent/${agentId}` : undefined;
+		const branchExists = branch
+			? run("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok
+			: false;
+		out.push({ info, agentId, branch, branchExists });
+	}
+	return out;
+}
+
+function formatRelativeAge(date: Date): string {
+	const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60_000));
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 48) return `${hours}h`;
+	return `${Math.round(hours / 24)}d`;
+}
+
+function formatResumeCandidate(candidate: ResumableSession, index: number): string {
+	const { info } = candidate;
+	const preview = truncateWithEllipsis(
+		stripTerminalNoise(info.name || info.firstMessage || "(empty session)").replace(/\s+/g, " ").trim(),
+		60,
+	);
+	const id = candidate.agentId ?? "?";
+	const branchNote = candidate.branch
+		? candidate.branchExists
+			? ""
+			: " [branch pruned; will recreate from HEAD]"
+		: " [no side-agent link; fresh branch]";
+	return `${index + 1}. ${id} · ${formatRelativeAge(info.modified)} ago · ${preview}${branchNote}`;
+}
+
 function normalizeAgentId(raw: string): string {
 	const trimmed = raw.trim();
 	if (!trimmed) return "";
@@ -1692,7 +1863,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		await ensureDir(getMetaDir(stateRoot));
 
 		let slug: string;
-		if (params.branchHint) {
+		if (params.resume?.agentIdHint) {
+			// Reuse the original agent id verbatim (it was already a valid id);
+			// re-sanitizing could truncate it and detach us from the old branch.
+			slug = params.resume.agentIdHint;
+		} else if (params.branchHint) {
 			slug = sanitizeSlug(params.branchHint);
 			if (!slug) slug = slugFromTask(params.task);
 		} else {
@@ -1703,6 +1878,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		await mutateRegistry(stateRoot, async (registry) => {
 			const existing = existingAgentIds(registry, repoRoot);
+			if (params.resume?.agentIdHint && !registry.agents[params.resume.agentIdHint]) {
+				// The resumed session's own branch (still checked out in an idle slot)
+				// must not force a -2 suffix onto its original id.
+				existing.delete(params.resume.agentIdHint);
+			}
 			agentId = deduplicateSlug(slug, existing);
 			registry.agents[agentId] = {
 				id: agentId,
@@ -1720,6 +1900,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			stateRoot,
 			agentId,
 			parentSessionId,
+			existingBranch: params.resume?.agentIdHint ? `side-agent/${params.resume.agentIdHint}` : undefined,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;
@@ -1753,32 +1934,42 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.warnings = [...(record.warnings ?? []), ...worktree.warnings];
 		});
 
-		const kickoff = await buildKickoffPrompt(ctx, params.task, params.includeSummary);
-		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
+		let kickoffPrompt: string;
+		if (params.resume) {
+			// Resumed sessions carry their own history; only send an extra prompt
+			// if the caller explicitly provided one.
+			kickoffPrompt = params.resume.prompt?.trim() ?? "";
+		} else {
+			const kickoff = await buildKickoffPrompt(ctx, params.task, params.includeSummary);
+			if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
+			kickoffPrompt = kickoff.prompt;
+		}
 
-		await atomicWrite(promptPath, kickoff.prompt + "\n");
-		try {
-			await mutateRegistry(stateRoot, async (registry) => {
-				const record = registry.agents[agentId];
-				if (!record) return;
-				await appendKickoffPromptToBacklog(stateRoot, record, kickoff.prompt);
-			});
-		} catch {
-			// Best effort fallback when registry lock/update fails; write directly
-			// to the known backlog path without requiring registry mutation.
-			await appendKickoffPromptToBacklog(
-				stateRoot,
-				{
-					id: agentId,
-					task: params.task,
-					status: "spawning_tmux",
-					startedAt: now,
-					updatedAt: nowIso(),
-					runtimeDir,
-					logPath,
-				},
-				kickoff.prompt,
-			);
+		await atomicWrite(promptPath, kickoffPrompt ? kickoffPrompt + "\n" : "");
+		if (kickoffPrompt) {
+			try {
+				await mutateRegistry(stateRoot, async (registry) => {
+					const record = registry.agents[agentId];
+					if (!record) return;
+					await appendKickoffPromptToBacklog(stateRoot, record, kickoffPrompt);
+				});
+			} catch {
+				// Best effort fallback when registry lock/update fails; write directly
+				// to the known backlog path without requiring registry mutation.
+				await appendKickoffPromptToBacklog(
+					stateRoot,
+					{
+						id: agentId,
+						task: params.task,
+						status: "spawning_tmux",
+						startedAt: now,
+						updatedAt: nowIso(),
+						runtimeDir,
+						logPath,
+					},
+					kickoffPrompt,
+				);
+			}
 		}
 
 		const resolvedModel = await resolveModelSpecForChild(ctx, params.model, pi.getThinkingLevel());
@@ -1805,6 +1996,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			exitFile,
 			modelSpec,
 			runtimeDir,
+			sessionPath: params.resume?.sessionPath,
 		});
 		await atomicWrite(launchScriptPath, launchScript);
 		await fs.chmod(launchScriptPath, 0o755);
@@ -1849,9 +2041,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			worktreePath: worktree.worktreePath,
 			branch: worktree.branch,
 			warnings: aggregatedWarnings,
-			prompt: kickoff.prompt,
+			prompt: kickoffPrompt,
 		};
-		emitKickoffPromptMessage(pi, started);
+		if (kickoffPrompt) {
+			emitKickoffPromptMessage(pi, started);
+		}
 
 		return started;
 	} catch (err) {
@@ -2450,6 +2644,74 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					`Found ${orphanLocks.blocked.length} orphan lock(s) that look live; leaving them untouched.`,
 					"warning",
 				);
+			}
+		},
+	});
+
+	pi.registerCommand("agent-resume", {
+		description: "Resume a previously /quit side-agent session (with its branch) in a worktree/tmux window: /agent-resume [prompt]",
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI) {
+				console.log("/agent-resume requires an interactive UI (session picker).");
+				return;
+			}
+
+			const stateRoot = getStateRoot(ctx);
+			const repoRoot = resolveGitRoot(stateRoot);
+
+			let candidates: ResumableSession[];
+			try {
+				candidates = await listResumableSessions(stateRoot, repoRoot);
+			} catch (err) {
+				ctx.ui.notify(`Failed to list resumable sessions: ${stringifyError(err)}`, "error");
+				return;
+			}
+			if (candidates.length === 0) {
+				ctx.ui.notify("No resumable side-agent sessions found in this project's worktrees.", "info");
+				return;
+			}
+
+			const labels = candidates.map((candidate, index) => formatResumeCandidate(candidate, index));
+			const choice = await ctx.ui.select("Resume side-agent session", labels);
+			if (choice === undefined) return;
+			const candidate = candidates[labels.indexOf(choice)];
+			if (!candidate) return;
+
+			const prompt = args.trim();
+			const taskPreview = candidate.info.name || candidate.info.firstMessage || "(resumed session)";
+
+			try {
+				ctx.ui.notify("Resuming side-agent…", "info");
+				const started = await startAgent(pi, ctx, {
+					task: `resume: ${taskPreview}`,
+					includeSummary: false,
+					resume: {
+						sessionPath: candidate.info.path,
+						agentIdHint: candidate.agentId,
+						prompt: prompt || undefined,
+					},
+				});
+
+				const lines = [
+					`id: ${started.id}`,
+					`session: ${candidate.info.path}`,
+					`tmux window: ${started.tmuxWindowId} (#${started.tmuxWindowIndex})`,
+					`worktree: ${started.worktreePath}`,
+					`branch: ${started.branch}`,
+				];
+				for (const warning of started.warnings) {
+					lines.push(`warning: ${warning}`);
+				}
+				if (started.prompt) {
+					lines.push("", "prompt:");
+					for (const line of started.prompt.split(/\r?\n/)) {
+						lines.push(`  ${line}`);
+					}
+				}
+				renderInfoMessage(pi, ctx, "side-agent resumed", lines);
+				await renderStatusLine(pi, ctx).catch(() => {});
+			} catch (err) {
+				ctx.ui.notify(`Failed to resume agent: ${stringifyError(err)}`, "error");
 			}
 		},
 	});

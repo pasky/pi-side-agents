@@ -20,6 +20,7 @@ The most advanced users of AI coding agents have worked like this for a while, b
 - New command `/agent [-model ...] <task>` to spawn a background child Pi agent.
 - Shows active-agent summary with tmux window numbers in the statusline.
 - New command `/agents` to inspect current agents and clean up stale state.
+- New command `/agent-resume` to pick a previously `/quit` side-agent session and reopen it (conversation + branch) in a worktree/tmux window.
 - New skill `agent-setup` to scaffold project-specific lifecycle scripts (flexible worktree initialization and merge process).
 - Exposes orchestration _tools_ for parent agents: `agent-start`, `agent-check`, `agent-wait-any`, `agent-send`
 
@@ -56,6 +57,7 @@ This registers the extension and skill with Pi. Restart Pi after installing.
    - Old worktrees are kept around and reused and updated by new agents.
    - Old branches are auto-pruned during reuse by a new agent.
    - You can pause your work on a topic—if you `/quit` before work is merged, the branch will stay around.
+   - Pick up a paused topic later with `/agent-resume [prompt]`: it lists past child sessions from this project's worktrees, then reopens the chosen session with its branch (in place if the worktree is untouched, otherwise in a fresh slot; a pruned no-commits branch is recreated from HEAD).
 
 <p align="center">
 <img width="706" height="364" alt="image" src="https://github.com/user-attachments/assets/212a0fc3-7f84-4889-9eaa-80007280df01" />
