@@ -1774,11 +1774,12 @@ const MAX_RESUME_CANDIDATES = 20;
 type ResumableSession = {
 	info: SessionInfo;
 	agentId: string;
-	/** Branch to reattach on resume; unset when a newer session owns the same agent id. */
+	/** Branch to reattach on resume; unset when the agent id is owned elsewhere
+	 * (a newer candidate session or a currently active agent). */
 	branch?: string;
 	branchExists: boolean;
-	/** True when a newer candidate session carries the same agent id. */
-	branchHeldByNewer: boolean;
+	/** True when the agent id is owned by a newer session or an active agent. */
+	branchHeldElsewhere: boolean;
 };
 
 /**
@@ -1831,7 +1832,10 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	infos.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 
 	const out: ResumableSession[] = [];
-	const seenAgentIds = new Set<string>();
+	// Seed with active agents' ids: their sessions are excluded from candidates,
+	// but their branches are live and must not be reattached to older sessions
+	// that happen to share the same agent id.
+	const seenAgentIds = new Set<string>(Object.keys(registry.agents));
 	for (const info of infos) {
 		if (out.length >= MAX_RESUME_CANDIDATES) break;
 		if (activeSessionPaths.has(resolve(info.path))) continue;
@@ -1840,15 +1844,15 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 		// Sessions without a side-agent-link were not created by this extension
 		// (e.g. pi run manually inside a slot); don't offer them as side-agents.
 		if (!agentId) continue;
-		// An agent id maps to one branch; only the newest session per id may
-		// reattach it — older incarnations resume onto a fresh branch instead.
-		const branchHeldByNewer = seenAgentIds.has(agentId);
+		// An agent id maps to one branch; only the newest inactive session per id
+		// may reattach it — others resume onto a fresh branch instead.
+		const branchHeldElsewhere = seenAgentIds.has(agentId);
 		seenAgentIds.add(agentId);
-		const branch = branchHeldByNewer ? undefined : `side-agent/${agentId}`;
+		const branch = branchHeldElsewhere ? undefined : `side-agent/${agentId}`;
 		const branchExists = branch
 			? run("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok
 			: false;
-		out.push({ info, agentId, branch, branchExists, branchHeldByNewer });
+		out.push({ info, agentId, branch, branchExists, branchHeldElsewhere });
 	}
 	return out;
 }
@@ -1871,7 +1875,7 @@ function formatResumeCandidate(candidate: ResumableSession, index: number): stri
 		? candidate.branchExists
 			? ""
 			: " [branch pruned; will recreate from HEAD]"
-		: " [branch taken by newer session; will use fresh branch]";
+		: " [branch owned by another session; will use fresh branch]";
 	return `${index + 1}. ${candidate.agentId} · ${formatRelativeAge(info.modified)} ago · ${preview}${branchNote}`;
 }
 
@@ -1913,11 +1917,13 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			if (generated.warning) aggregatedWarnings.push(generated.warning);
 		}
 
+		let resumeBranch = params.resume?.branch;
+		const reattachId = resumeBranch?.startsWith("side-agent/")
+			? resumeBranch.slice("side-agent/".length)
+			: undefined;
+
 		await mutateRegistry(stateRoot, async (registry) => {
 			const existing = existingAgentIds(registry, repoRoot);
-			const reattachId = params.resume?.branch?.startsWith("side-agent/")
-				? params.resume.branch.slice("side-agent/".length)
-				: undefined;
 			if (reattachId && !registry.agents[reattachId]) {
 				// The resumed session's own branch (parked by /quit) must not force
 				// a -2 suffix onto its original id.
@@ -1935,12 +1941,22 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			};
 		});
 
+		// Safety: reattach the branch only if we actually got its agent id — if
+		// dedup had to suffix the id (e.g. an active agent owns it), the branch
+		// belongs to that other agent and must not be hijacked.
+		if (resumeBranch && reattachId !== agentId) {
+			aggregatedWarnings.push(
+				`Agent id ${agentId} does not match branch ${resumeBranch} (owned elsewhere); resuming on a fresh branch instead.`,
+			);
+			resumeBranch = undefined;
+		}
+
 		const worktree = await allocateWorktree({
 			repoRoot,
 			stateRoot,
 			agentId,
 			parentSessionId,
-			existingBranch: params.resume?.branch,
+			existingBranch: resumeBranch,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;

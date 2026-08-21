@@ -949,17 +949,19 @@ function extractSessionAgentId(raw) {
 /**
  * Ported from extensions/side-agents.ts listResumableSessions branch
  * assignment (contract copy): newest-first candidates; only the first
- * session per agent id may reattach `side-agent/<id>`.
+ * session per agent id may reattach `side-agent/<id>`, and ids of currently
+ * active agents are seeded as already taken.
  * @param {Array<{agentId: string | undefined}>} newestFirst
+ * @param {Set<string>} activeAgentIds
  */
-function assignResumeBranches(newestFirst) {
-	const seen = new Set();
+function assignResumeBranches(newestFirst, activeAgentIds = new Set()) {
+	const seen = new Set(activeAgentIds);
 	const out = [];
 	for (const { agentId } of newestFirst) {
 		if (!agentId) continue; // no side-agent-link → not offered
-		const branchHeldByNewer = seen.has(agentId);
+		const branchHeldElsewhere = seen.has(agentId);
 		seen.add(agentId);
-		out.push({ agentId, branch: branchHeldByNewer ? undefined : `side-agent/${agentId}`, branchHeldByNewer });
+		out.push({ agentId, branch: branchHeldElsewhere ? undefined : `side-agent/${agentId}`, branchHeldElsewhere });
 	}
 	return out;
 }
@@ -1012,8 +1014,19 @@ test("assignResumeBranches — newest session per agent id keeps the branch", ()
 		{ agentId: undefined }, // no link → excluded
 	]);
 	assert.deepStrictEqual(out, [
-		{ agentId: "fix-auth", branch: "side-agent/fix-auth", branchHeldByNewer: false },
-		{ agentId: "add-retry", branch: "side-agent/add-retry", branchHeldByNewer: false },
-		{ agentId: "fix-auth", branch: undefined, branchHeldByNewer: true },
+		{ agentId: "fix-auth", branch: "side-agent/fix-auth", branchHeldElsewhere: false },
+		{ agentId: "add-retry", branch: "side-agent/add-retry", branchHeldElsewhere: false },
+		{ agentId: "fix-auth", branch: undefined, branchHeldElsewhere: true },
+	]);
+});
+
+test("assignResumeBranches — active agent ids block branch reattachment", () => {
+	const out = assignResumeBranches(
+		[{ agentId: "fix-auth" }, { agentId: "add-retry" }],
+		new Set(["fix-auth"]), // fix-auth is currently running — its branch is live
+	);
+	assert.deepStrictEqual(out, [
+		{ agentId: "fix-auth", branch: undefined, branchHeldElsewhere: true },
+		{ agentId: "add-retry", branch: "side-agent/add-retry", branchHeldElsewhere: false },
 	]);
 });

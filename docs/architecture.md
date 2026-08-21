@@ -123,7 +123,7 @@ It then tries to delete the previous branch name (only if fully merged) to avoid
 
 ### 5.3b Resume allocation (`/agent-resume`)
 
-Resume discovery filters pi's own session registry (`SessionManager.list`) down to this repo's worktree slots, keeps only sessions carrying a `side-agent-link` entry (the last such entry names the agent id → branch `side-agent/<id>`), excludes sessions of currently tracked agents, and offers the newest ~20. When several sessions share an agent id, only the newest may reattach the branch; older ones get a fresh branch.
+Resume discovery filters pi's own session registry (`SessionManager.list`) down to this repo's worktree slots, keeps only sessions carrying a `side-agent-link` entry (the last such entry names the agent id → branch `side-agent/<id>`), excludes sessions of currently tracked agents, and offers the newest ~20. When several sessions share an agent id — including the id of a currently active agent — only the newest inactive session may reattach the branch; the rest get a fresh branch. Discovery uses pi's default per-cwd session directories (children are always launched without `--session-dir`); sessions written to a custom `--session-dir` are not discovered.
 
 Worktree allocation in resume mode:
 
