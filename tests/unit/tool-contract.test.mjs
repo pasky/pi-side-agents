@@ -918,3 +918,102 @@ test("agent branch name follows side-agent/<slug> convention", () => {
 	assert.ok(!branch.startsWith("/"), "branch must not start with /");
 	assert.ok(!branch.startsWith("."), "branch must not start with .");
 });
+
+// ---------------------------------------------------------------------------
+// 6. /agent-resume contracts
+// ---------------------------------------------------------------------------
+
+const CHILD_LINK_ENTRY_TYPE = "side-agent-link";
+
+/**
+ * Ported from extensions/side-agents.ts readSessionAgentId (contract copy).
+ * The LAST side-agent-link entry wins.
+ * @param {string} raw session file content (JSONL)
+ */
+function extractSessionAgentId(raw) {
+	let found;
+	for (const line of raw.split("\n")) {
+		if (!line.includes(CHILD_LINK_ENTRY_TYPE)) continue;
+		try {
+			const entry = JSON.parse(line);
+			if (entry?.customType === CHILD_LINK_ENTRY_TYPE && typeof entry.data?.agentId === "string") {
+				found = entry.data.agentId;
+			}
+		} catch {
+			// skip unparsable lines
+		}
+	}
+	return found;
+}
+
+/**
+ * Ported from extensions/side-agents.ts listResumableSessions branch
+ * assignment (contract copy): newest-first candidates; only the first
+ * session per agent id may reattach `side-agent/<id>`.
+ * @param {Array<{agentId: string | undefined}>} newestFirst
+ */
+function assignResumeBranches(newestFirst) {
+	const seen = new Set();
+	const out = [];
+	for (const { agentId } of newestFirst) {
+		if (!agentId) continue; // no side-agent-link → not offered
+		const branchHeldByNewer = seen.has(agentId);
+		seen.add(agentId);
+		out.push({ agentId, branch: branchHeldByNewer ? undefined : `side-agent/${agentId}`, branchHeldByNewer });
+	}
+	return out;
+}
+
+test("extractSessionAgentId — finds agent id in link entry", () => {
+	const raw = [
+		JSON.stringify({ type: "custom", customType: "other", data: { agentId: "nope" } }),
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: "fix-auth" } }),
+	].join("\n");
+	assert.strictEqual(extractSessionAgentId(raw), "fix-auth");
+});
+
+test("extractSessionAgentId — last link entry wins (resumed under deduplicated id)", () => {
+	const raw = [
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: "fix-auth" } }),
+		JSON.stringify({ type: "message" }),
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: "fix-auth-2" } }),
+	].join("\n");
+	assert.strictEqual(extractSessionAgentId(raw), "fix-auth-2");
+});
+
+test("extractSessionAgentId — tolerates malformed lines and missing links", () => {
+	assert.strictEqual(extractSessionAgentId(""), undefined);
+	assert.strictEqual(extractSessionAgentId('{"type":"message"}'), undefined);
+	const raw = [
+		`garbage ${CHILD_LINK_ENTRY_TYPE} not-json`,
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: "ok-id" } }),
+	].join("\n");
+	assert.strictEqual(extractSessionAgentId(raw), "ok-id");
+});
+
+test("extractSessionAgentId — ignores link entries with non-string agentId", () => {
+	const raw = [
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: 42 } }),
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: {} }),
+	].join("\n");
+	assert.strictEqual(extractSessionAgentId(raw), undefined);
+	const mixed = [
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: "real-id" } }),
+		JSON.stringify({ type: "custom", customType: CHILD_LINK_ENTRY_TYPE, data: { agentId: null } }),
+	].join("\n");
+	assert.strictEqual(extractSessionAgentId(mixed), "real-id");
+});
+
+test("assignResumeBranches — newest session per agent id keeps the branch", () => {
+	const out = assignResumeBranches([
+		{ agentId: "fix-auth" },
+		{ agentId: "add-retry" },
+		{ agentId: "fix-auth" }, // older incarnation of the same id
+		{ agentId: undefined }, // no link → excluded
+	]);
+	assert.deepStrictEqual(out, [
+		{ agentId: "fix-auth", branch: "side-agent/fix-auth", branchHeldByNewer: false },
+		{ agentId: "add-retry", branch: "side-agent/add-retry", branchHeldByNewer: false },
+		{ agentId: "fix-auth", branch: undefined, branchHeldByNewer: true },
+	]);
+});

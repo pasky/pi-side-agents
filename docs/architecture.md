@@ -21,6 +21,7 @@ Run multiple Pi coding tasks in parallel without blocking the main session:
 
 - `/agent [-model <provider/id-or-pattern>] <task>` — spawn a child agent.
 - `/agents` — list tracked agents, show orphan worktree locks, offer interactive cleanup.
+- `/agent-resume [prompt]` — pick a previously `/quit` child session and reopen it (conversation + branch) in a worktree/tmux window.
 
 ### Tools (for orchestration)
 
@@ -74,7 +75,8 @@ Agent IDs are **kebab-case slugs** (e.g. `fix-auth-leak`, `add-auth-tests-2`).
 - `agent-start` requires an explicit `branchHint` slug.
 - IDs are deduplicated (`-2`, `-3`, …) against:
   - current registry entries
-  - any existing `side-agent/<id>` branches in `git worktree list --porcelain`
+  - all existing `side-agent/<id>` branch refs (including parked, not-checked-out branches left behind by `/quit`)
+  - any `side-agent/<id>` branches in `git worktree list --porcelain`
 
 ### 4.2 Branch names
 
@@ -112,11 +114,24 @@ This is intentional: it lets you spawn agents from whatever state you are curren
 For an already-registered worktree slot, the extension performs (best-effort):
 
 - `git merge --abort` (ignore errors)
+- `git checkout --detach` (so the reset below moves only HEAD, never the old branch ref — unmerged branches must survive slot recycling)
 - `git reset --hard <parentHead>`
 - `git clean -fd`
 - `git checkout -B side-agent/<agentId> <parentHead>`
 
 It then tries to delete the previous branch name (only if fully merged) to avoid accumulating old side-agent branches.
+
+### 5.3b Resume allocation (`/agent-resume`)
+
+Resume discovery filters pi's own session registry (`SessionManager.list`) down to this repo's worktree slots, keeps only sessions carrying a `side-agent-link` entry (the last such entry names the agent id → branch `side-agent/<id>`), excludes sessions of currently tracked agents, and offers the newest ~20. When several sessions share an agent id, only the newest may reattach the branch; older ones get a fresh branch.
+
+Worktree allocation in resume mode:
+
+- Branch still checked out in an **idle, unlocked slot** → resume in place; the working tree is left untouched (it may carry uncommitted state from before `/quit`).
+- Branch exists but is not checked out → normal slot selection, then `git checkout <branch>` (no reset to parent HEAD).
+- Branch was pruned (it was fully merged) → recreated from current HEAD with a warning.
+
+The child pi is launched with `--session <file>` when the session's recorded cwd matches the allocated worktree (in-place), and with `--fork <file>` otherwise — pi restores the session's cwd from its header, so re-homing into a different slot requires a fork. No `--model` is passed on resume (the session restores its own model); an optional `/agent-resume [prompt]` argument is sent as the kickoff message, otherwise the session reopens idle.
 
 ### 5.4 Worktree lock file (`.pi/active.lock`)
 

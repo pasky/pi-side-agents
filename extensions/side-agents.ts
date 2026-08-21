@@ -96,10 +96,16 @@ type StartAgentParams = {
 	includeSummary: boolean;
 	/** Resume a previously quit child session instead of starting fresh. */
 	resume?: {
-		/** Path to the pi session file to resume (passed to `pi --session`). */
+		/** Path to the pi session file to resume. */
 		sessionPath: string;
+		/** The session's recorded cwd; when it matches the allocated worktree the
+		 * session is continued in place (--session), otherwise it is forked
+		 * (--fork) so pi re-homes it into the new worktree. */
+		sessionCwd?: string;
 		/** Original agent id from the session's side-agent-link entry, if known. */
 		agentIdHint?: string;
+		/** Pre-existing side-agent branch to reattach; omit to start a fresh branch. */
+		branch?: string;
 		/** Optional extra prompt to send on resume; empty = just reopen the session. */
 		prompt?: string;
 	};
@@ -723,9 +729,22 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 	}
 }
 
-/** Collect all agent IDs currently known in the registry or checked out as side-agent branches. */
+/** Collect all agent IDs currently known in the registry, existing as side-agent branch refs, or checked out in worktrees. */
 function existingAgentIds(registry: RegistryFile, repoRoot: string): Set<string> {
 	const ids = new Set<string>(Object.keys(registry.agents));
+
+	// All side-agent/* refs — including branches parked by /quit that are not
+	// checked out anywhere. Without this, a later agent with the same slug
+	// would `checkout -B` the preserved ref and orphan its commits.
+	const refs = run("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/side-agent/"]);
+	if (refs.ok) {
+		for (const line of refs.stdout.split(/\r?\n/)) {
+			const name = line.trim();
+			if (name.startsWith("side-agent/")) {
+				ids.add(name.slice("side-agent/".length));
+			}
+		}
+	}
 
 	const listed = run("git", ["-C", repoRoot, "worktree", "list", "--porcelain"]);
 	if (listed.ok) {
@@ -1238,8 +1257,10 @@ function buildLaunchScript(params: {
 	exitFile: string;
 	modelSpec?: string;
 	runtimeDir: string;
-	/** Resume mode: pi session file to reopen via --session. */
+	/** Resume mode: pi session file to reopen. */
 	sessionPath?: string;
+	/** "session" continues the file in place (cwd matches); "fork" re-homes it into this worktree. */
+	sessionMode?: "session" | "fork";
 }): string {
 	return `#!/usr/bin/env bash
 set -euo pipefail
@@ -1254,6 +1275,7 @@ PROMPT_FILE=${shellQuote(params.promptPath)}
 EXIT_FILE=${shellQuote(params.exitFile)}
 MODEL_SPEC=${shellQuote(params.modelSpec ?? "")}
 SESSION_FILE=${shellQuote(params.sessionPath ?? "")}
+SESSION_FLAG=${shellQuote(params.sessionMode === "session" ? "--session" : "--fork")}
 RUNTIME_DIR=${shellQuote(params.runtimeDir)}
 START_SCRIPT=\"$WORKTREE/.pi/side-agent-start.sh\"
 CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
@@ -1308,7 +1330,7 @@ if [[ -n "$MODEL_SPEC" ]]; then
   PI_CMD+=(--model "$MODEL_SPEC")
 fi
 if [[ -n "$SESSION_FILE" ]]; then
-  PI_CMD+=(--session "$SESSION_FILE")
+  PI_CMD+=("$SESSION_FLAG" "$SESSION_FILE")
 fi
 if [[ -d "$CHILD_SKILLS_DIR" ]]; then
   # agent-setup writes the child-only finish skill here; load it explicitly.
@@ -1751,13 +1773,21 @@ const MAX_RESUME_CANDIDATES = 20;
 
 type ResumableSession = {
 	info: SessionInfo;
-	agentId?: string;
+	agentId: string;
+	/** Branch to reattach on resume; unset when a newer session owns the same agent id. */
 	branch?: string;
 	branchExists: boolean;
+	/** True when a newer candidate session carries the same agent id. */
+	branchHeldByNewer: boolean;
 };
 
-/** Extract the original agent id from a child session's side-agent-link entry. */
+/**
+ * Extract the agent id from a child session's side-agent-link entries.
+ * The LAST entry wins: a session resumed under a deduplicated id (e.g.
+ * fix-auth-2) appends a corrected link entry after the inherited one.
+ */
 async function readSessionAgentId(sessionPath: string): Promise<string | undefined> {
+	let found: string | undefined;
 	try {
 		const raw = await fs.readFile(sessionPath, "utf8");
 		for (const line of raw.split("\n")) {
@@ -1765,7 +1795,7 @@ async function readSessionAgentId(sessionPath: string): Promise<string | undefin
 			try {
 				const entry = JSON.parse(line) as { customType?: string; data?: { agentId?: unknown } };
 				if (entry?.customType === CHILD_LINK_ENTRY_TYPE && typeof entry.data?.agentId === "string") {
-					return entry.data.agentId;
+					found = entry.data.agentId;
 				}
 			} catch {
 				// skip unparsable lines
@@ -1774,7 +1804,7 @@ async function readSessionAgentId(sessionPath: string): Promise<string | undefin
 	} catch {
 		// unreadable session file
 	}
-	return undefined;
+	return found;
 }
 
 /**
@@ -1801,16 +1831,24 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	infos.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 
 	const out: ResumableSession[] = [];
+	const seenAgentIds = new Set<string>();
 	for (const info of infos) {
 		if (out.length >= MAX_RESUME_CANDIDATES) break;
 		if (activeSessionPaths.has(resolve(info.path))) continue;
 		if (info.messageCount === 0) continue;
 		const agentId = await readSessionAgentId(info.path);
-		const branch = agentId ? `side-agent/${agentId}` : undefined;
+		// Sessions without a side-agent-link were not created by this extension
+		// (e.g. pi run manually inside a slot); don't offer them as side-agents.
+		if (!agentId) continue;
+		// An agent id maps to one branch; only the newest session per id may
+		// reattach it — older incarnations resume onto a fresh branch instead.
+		const branchHeldByNewer = seenAgentIds.has(agentId);
+		seenAgentIds.add(agentId);
+		const branch = branchHeldByNewer ? undefined : `side-agent/${agentId}`;
 		const branchExists = branch
 			? run("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok
 			: false;
-		out.push({ info, agentId, branch, branchExists });
+		out.push({ info, agentId, branch, branchExists, branchHeldByNewer });
 	}
 	return out;
 }
@@ -1829,13 +1867,12 @@ function formatResumeCandidate(candidate: ResumableSession, index: number): stri
 		stripTerminalNoise(info.name || info.firstMessage || "(empty session)").replace(/\s+/g, " ").trim(),
 		60,
 	);
-	const id = candidate.agentId ?? "?";
 	const branchNote = candidate.branch
 		? candidate.branchExists
 			? ""
 			: " [branch pruned; will recreate from HEAD]"
-		: " [no side-agent link; fresh branch]";
-	return `${index + 1}. ${id} · ${formatRelativeAge(info.modified)} ago · ${preview}${branchNote}`;
+		: " [branch taken by newer session; will use fresh branch]";
+	return `${index + 1}. ${candidate.agentId} · ${formatRelativeAge(info.modified)} ago · ${preview}${branchNote}`;
 }
 
 function normalizeAgentId(raw: string): string {
@@ -1878,10 +1915,13 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		await mutateRegistry(stateRoot, async (registry) => {
 			const existing = existingAgentIds(registry, repoRoot);
-			if (params.resume?.agentIdHint && !registry.agents[params.resume.agentIdHint]) {
-				// The resumed session's own branch (still checked out in an idle slot)
-				// must not force a -2 suffix onto its original id.
-				existing.delete(params.resume.agentIdHint);
+			const reattachId = params.resume?.branch?.startsWith("side-agent/")
+				? params.resume.branch.slice("side-agent/".length)
+				: undefined;
+			if (reattachId && !registry.agents[reattachId]) {
+				// The resumed session's own branch (parked by /quit) must not force
+				// a -2 suffix onto its original id.
+				existing.delete(reattachId);
 			}
 			agentId = deduplicateSlug(slug, existing);
 			registry.agents[agentId] = {
@@ -1900,7 +1940,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			stateRoot,
 			agentId,
 			parentSessionId,
-			existingBranch: params.resume?.agentIdHint ? `side-agent/${params.resume.agentIdHint}` : undefined,
+			existingBranch: params.resume?.branch,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;
@@ -1972,7 +2012,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			}
 		}
 
-		const resolvedModel = await resolveModelSpecForChild(ctx, params.model, pi.getThinkingLevel());
+		// Resumed sessions restore their own recorded model; only pass --model for
+		// fresh agents (or an explicit override).
+		const resolvedModel = params.resume
+			? { modelSpec: params.model }
+			: await resolveModelSpecForChild(ctx, params.model, pi.getThinkingLevel());
 		const modelSpec = resolvedModel.modelSpec;
 		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
@@ -1997,6 +2041,12 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			modelSpec,
 			runtimeDir,
 			sessionPath: params.resume?.sessionPath,
+			sessionMode:
+				params.resume &&
+				params.resume.sessionCwd &&
+				resolve(params.resume.sessionCwd) === resolve(worktree.worktreePath)
+					? "session"
+					: "fork",
 		});
 		await atomicWrite(launchScriptPath, launchScript);
 		await fs.chmod(launchScriptPath, 0o755);
@@ -2284,13 +2334,19 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 		await atomicWrite(lockPath, JSON.stringify(lock, null, 2) + "\n");
 	}
 
-	const hasLinkEntry = ctx.sessionManager.getEntries().some((entry) => {
-		if (entry.type !== "custom") return false;
-		const customEntry = entry as { customType?: string };
-		return customEntry.customType === CHILD_LINK_ENTRY_TYPE;
-	});
+	// Determine the agent id recorded by the LAST link entry; a resumed/forked
+	// session may have inherited a link for a different (original) agent id and
+	// then needs a corrected entry appended so later /agent-resume discovery
+	// maps this session to the right branch.
+	let linkedAgentId: string | undefined;
+	for (const entry of ctx.sessionManager.getEntries()) {
+		if (entry.type !== "custom") continue;
+		const customEntry = entry as { customType?: string; data?: { agentId?: unknown } };
+		if (customEntry.customType !== CHILD_LINK_ENTRY_TYPE) continue;
+		linkedAgentId = typeof customEntry.data?.agentId === "string" ? customEntry.data.agentId : linkedAgentId;
+	}
 
-	if (!hasLinkEntry) {
+	if (linkedAgentId !== agentId) {
 		pi.appendEntry(CHILD_LINK_ENTRY_TYPE, {
 			agentId,
 			parentSession,
@@ -2687,7 +2743,9 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					includeSummary: false,
 					resume: {
 						sessionPath: candidate.info.path,
+						sessionCwd: candidate.info.cwd || undefined,
 						agentIdHint: candidate.agentId,
+						branch: candidate.branch,
 						prompt: prompt || undefined,
 					},
 				});
