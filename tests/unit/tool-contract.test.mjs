@@ -926,8 +926,8 @@ test("agent branch name follows side-agent/<slug> convention", () => {
 const CHILD_LINK_ENTRY_TYPE = "side-agent-link";
 
 /**
- * Ported from extensions/side-agents.ts readSessionAgentId (contract copy).
- * The LAST side-agent-link entry wins.
+ * Ported from extensions/side-agents.ts scanSessionFile link-entry extraction
+ * (contract copy). The LAST side-agent-link entry wins.
  * @param {string} raw session file content (JSONL)
  */
 function extractSessionAgentId(raw) {

@@ -21,7 +21,7 @@ Run multiple Pi coding tasks in parallel without blocking the main session:
 
 - `/agent [-model <provider/id-or-pattern>] <task>` — spawn a child agent.
 - `/agents` — list tracked agents, show orphan worktree locks, offer interactive cleanup.
-- `/agent-resume [prompt]` — pick a previously `/quit` child session and reopen it (conversation + branch) in a worktree/tmux window.
+- `/agent-resume` — pick a previously `/quit` child session and reopen it (conversation + branch) in a worktree/tmux window.
 
 ### Tools (for orchestration)
 
@@ -123,7 +123,7 @@ It then tries to delete the previous branch name (only if fully merged) to avoid
 
 ### 5.3b Resume allocation (`/agent-resume`)
 
-Resume discovery filters pi's own session registry (`SessionManager.list`) down to this repo's worktree slots, keeps only sessions carrying a `side-agent-link` entry (the last such entry names the agent id → branch `side-agent/<id>`), excludes sessions of currently tracked agents, and offers the newest ~20. When several sessions share an agent id — including the id of a currently active agent — only the newest inactive session may reattach the branch; the rest get a fresh branch. Discovery uses pi's default per-cwd session directories (children are always launched without `--session-dir`); sessions written to a custom `--session-dir` are not discovered.
+Resume discovery scans pi's default per-cwd session directories for this repo's worktree slots directly (mtime-sorted file listing; only the newest ~20 files are content-scanned, with substring-gated JSONL parsing — `SessionManager.list` would parse every line of every session, which is prohibitively slow on big projects). It keeps only sessions carrying a `side-agent-link` entry (the last such entry names the agent id → branch `side-agent/<id>`) and excludes sessions of currently tracked agents. When several sessions share an agent id — including the id of a currently active agent — only the newest inactive session may reattach the branch; the rest get a fresh branch. Children are always launched without `--session-dir`; sessions written to a custom `--session-dir` are not discovered.
 
 Worktree allocation in resume mode:
 
@@ -131,7 +131,7 @@ Worktree allocation in resume mode:
 - Branch exists but is not checked out → normal slot selection, then `git checkout <branch>` (no reset to parent HEAD).
 - Branch was pruned (it was fully merged) → recreated from current HEAD with a warning.
 
-The child pi is launched with `--session <file>` when the session's recorded cwd matches the allocated worktree (in-place), and with `--fork <file>` otherwise — pi restores the session's cwd from its header, so re-homing into a different slot requires a fork. No `--model` is passed on resume (the session restores its own model); an optional `/agent-resume [prompt]` argument is sent as the kickoff message, otherwise the session reopens idle.
+The child pi is launched with `--session <file>` when the session's recorded cwd matches the allocated worktree (in-place), and with `--fork <file>` otherwise — pi restores the session's cwd from its header, so re-homing into a different slot requires a fork. No `--model` is passed on resume (the session restores its own model) and no kickoff prompt is sent — the session reopens idle, ready for you (or `agent-send`) in its tmux window.
 
 ### 5.4 Worktree lock file (`.pi/active.lock`)
 
