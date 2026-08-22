@@ -1,6 +1,6 @@
 import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai/compat";
-import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, serializeConversation, SessionSelectorComponent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionInfo } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawnSync } from "node:child_process";
@@ -733,13 +733,14 @@ function existingAgentIds(registry: RegistryFile, repoRoot: string): Set<string>
 
 	// All side-agent/* refs — including branches parked by /quit that are not
 	// checked out anywhere. Without this, a later agent with the same slug
-	// would `checkout -B` the preserved ref and orphan its commits.
-	const refs = run("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/side-agent/"]);
+	// would `checkout -B` the preserved ref and orphan its commits. Full
+	// refnames: %(refname:short) is ambiguous when a same-named tag exists.
+	const refs = run("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname)", "refs/heads/side-agent/"]);
 	if (refs.ok) {
 		for (const line of refs.stdout.split(/\r?\n/)) {
-			const name = line.trim();
-			if (name.startsWith("side-agent/")) {
-				ids.add(name.slice("side-agent/".length));
+			const ref = line.trim();
+			if (ref.startsWith("refs/heads/side-agent/")) {
+				ids.add(ref.slice("refs/heads/side-agent/".length));
 			}
 		}
 	}
@@ -1764,13 +1765,20 @@ async function resolveModelSpecForChild(
 	return { modelSpec: trimmed };
 }
 
-const MAX_RESUME_CANDIDATES = 20;
+// Per-file scan bounds: everything we need lives near the start of a session
+// file (header, kickoff message, initial link entry) or near its end (link
+// corrections, latest session_info name), so head+tail slices give correct
+// results while keeping the per-file cost bounded — no candidate cap needed.
+const SCAN_HEAD_BYTES = 128 * 1024;
+const SCAN_TAIL_BYTES = 128 * 1024;
 
 type ResumableSession = {
 	path: string;
 	/** cwd recorded in the session header (used for in-place vs fork decision). */
 	sessionCwd?: string;
 	modified: Date;
+	created: Date;
+	messageCount: number;
 	name?: string;
 	firstMessage?: string;
 	agentId: string;
@@ -1790,11 +1798,28 @@ function getPiAgentDir(): string {
 		: join(homedir, ".pi", "agent");
 }
 
-/** Pi's default per-cwd session directory (mirrors pi's own path encoding). */
-function sessionDirForCwd(cwd: string): string {
-	const resolvedCwd = resolve(cwd);
-	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-	return join(getPiAgentDir(), "sessions", safePath);
+/** Pi's per-cwd session directory name encoding (mirrors pi's own). */
+function encodeSessionDirName(cwd: string): string {
+	return `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+}
+
+/**
+ * Session directories of this repo's agent worktree slots — enumerated by the
+ * encoded directory-name pattern in pi's sessions root, NOT by live slot
+ * directories: sessions of since-deleted worktree slots remain resumable
+ * (resume forks re-home them into whatever slot gets allocated).
+ */
+async function listSlotSessionDirs(repoRoot: string): Promise<string[]> {
+	const sessionsRoot = join(getPiAgentDir(), "sessions");
+	const slotPathPrefix = join(dirname(repoRoot), `${basename(repoRoot)}-agent-worktree-`);
+	const encodedPrefix = encodeSessionDirName(slotPathPrefix).replace(/--$/, "");
+	// Match slot roots AND subdirectories of slots (pi sessions may be started
+	// deeper in a worktree, e.g. after a ctrl+z cd; they inherit the agent env
+	// and carry link entries). The side-agent-link filter downstream is the
+	// real gate against unrelated sessions.
+	const re = new RegExp(`^${encodedPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d{4}(?:-.+)?--$`);
+	const entries = await fs.readdir(sessionsRoot).catch(() => [] as string[]);
+	return entries.filter((name) => re.test(name)).map((name) => join(sessionsRoot, name));
 }
 
 type ScannedSession = {
@@ -1802,7 +1827,8 @@ type ScannedSession = {
 	agentId?: string;
 	name?: string;
 	firstMessage?: string;
-	hasMessage: boolean;
+	/** Approximate for large (sliced) files. */
+	messageCount: number;
 };
 
 function extractTextFromMessageContent(content: unknown): string {
@@ -1819,6 +1845,37 @@ function extractTextFromMessageContent(content: unknown): string {
 }
 
 /**
+ * Read a session file's lines for scanning. Small files are read whole; large
+ * files contribute only head+tail slices (partial lines at the cut points are
+ * dropped — a middle-of-file session_info rename may be missed, degrading the
+ * preview to the kickoff message, which is acceptable).
+ */
+async function readSessionSliceLines(sessionPath: string): Promise<string[] | undefined> {
+	try {
+		const handle = await fs.open(sessionPath, "r");
+		try {
+			const { size } = await handle.stat();
+			if (size <= SCAN_HEAD_BYTES + SCAN_TAIL_BYTES) {
+				return (await handle.readFile({ encoding: "utf8" })).split("\n");
+			}
+			const head = Buffer.alloc(SCAN_HEAD_BYTES);
+			await handle.read(head, 0, SCAN_HEAD_BYTES, 0);
+			const tail = Buffer.alloc(SCAN_TAIL_BYTES);
+			await handle.read(tail, 0, SCAN_TAIL_BYTES, size - SCAN_TAIL_BYTES);
+			const headLines = head.toString("utf8").split("\n");
+			headLines.pop(); // partial line at the cut
+			const tailLines = tail.toString("utf8").split("\n");
+			tailLines.shift(); // partial line at the cut
+			return [...headLines, ...tailLines];
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Single-pass, substring-gated scan of a session file. Unlike
  * SessionManager.list() this does NOT JSON-parse every line of every session
  * (which is prohibitively slow across hundreds of MB of session history);
@@ -1827,24 +1884,20 @@ function extractTextFromMessageContent(content: unknown): string {
  * - first user message → preview text
  * - side-agent-link entries → agent id (LAST entry wins: a session resumed
  *   under a deduplicated id appends a corrected link after the inherited one)
- * - session_info entries → display name (last wins)
+ * - session_info entries → display name (last wins, empty clears)
  */
 async function scanSessionFile(sessionPath: string): Promise<ScannedSession> {
-	const out: ScannedSession = { hasMessage: false };
-	let raw: string;
-	try {
-		raw = await fs.readFile(sessionPath, "utf8");
-	} catch {
-		return out;
-	}
+	const out: ScannedSession = { messageCount: 0 };
+	const lines = await readSessionSliceLines(sessionPath);
+	if (!lines) return out;
 
-	for (const line of raw.split("\n")) {
+	for (const line of lines) {
 		try {
 			if (!out.sessionCwd && line.includes('"type":"session"')) {
 				const entry = JSON.parse(line) as { type?: string; cwd?: unknown };
 				if (entry?.type === "session" && typeof entry.cwd === "string") out.sessionCwd = entry.cwd;
 			} else if (line.includes('"type":"message"')) {
-				out.hasMessage = true;
+				out.messageCount += 1;
 				if (out.firstMessage === undefined) {
 					const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
 					if (entry?.type === "message" && entry.message?.role === "user") {
@@ -1859,8 +1912,10 @@ async function scanSessionFile(sessionPath: string): Promise<ScannedSession> {
 				}
 			} else if (line.includes('"type":"session_info"')) {
 				const entry = JSON.parse(line) as { type?: string; name?: unknown };
-				if (entry?.type === "session_info" && typeof entry.name === "string" && entry.name) {
-					out.name = entry.name;
+				if (entry?.type === "session_info") {
+					// Latest entry wins — including an empty/missing name, which pi
+					// defines as clearing the session title.
+					out.name = typeof entry.name === "string" && entry.name ? entry.name : undefined;
 				}
 			}
 		} catch {
@@ -1873,7 +1928,8 @@ async function scanSessionFile(sessionPath: string): Promise<ScannedSession> {
 /**
  * List resumable child sessions: pi's default session dirs for this repo's
  * side-agent worktree slots, minus sessions of currently tracked (live)
- * agents, newest first. Only the newest ~20 files are actually parsed.
+ * agents, newest first. All sessions are offered; per-file scan cost is
+ * bounded by head+tail slicing.
  */
 async function listResumableSessions(stateRoot: string, repoRoot: string): Promise<ResumableSession[]> {
 	const registry = await refreshAllAgents(stateRoot);
@@ -1883,10 +1939,8 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	}
 
 	// Cheap pass: collect candidate files with mtimes only (no content reads).
-	const slots = await listWorktreeSlots(repoRoot);
 	const files: Array<{ path: string; modified: Date }> = [];
-	for (const slot of slots) {
-		const dir = sessionDirForCwd(slot.path);
+	for (const dir of await listSlotSessionDirs(repoRoot)) {
 		const entries = await fs.readdir(dir).catch(() => [] as string[]);
 		for (const name of entries) {
 			if (!name.endsWith(".jsonl")) continue;
@@ -1901,12 +1955,15 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	}
 	files.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 
-	// One ref listing instead of a git spawn per candidate.
+	// One ref listing instead of a git spawn per candidate. Full refnames:
+	// %(refname:short) is ambiguous when a same-named tag exists (it would
+	// print heads/side-agent/foo and break the lookup).
 	const branchRefs = new Set<string>();
-	const refs = run("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/side-agent/"]);
+	const refs = run("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname)", "refs/heads/side-agent/"]);
 	if (refs.ok) {
 		for (const line of refs.stdout.split(/\r?\n/)) {
-			if (line.trim()) branchRefs.add(line.trim());
+			const ref = line.trim();
+			if (ref.startsWith("refs/heads/")) branchRefs.add(ref.slice("refs/heads/".length));
 		}
 	}
 
@@ -1916,12 +1973,11 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	// that happen to share the same agent id.
 	const seenAgentIds = new Set<string>(Object.keys(registry.agents));
 	for (const file of files) {
-		if (out.length >= MAX_RESUME_CANDIDATES) break;
 		if (activeSessionPaths.has(resolve(file.path))) continue;
 		const scanned = await scanSessionFile(file.path);
 		// Sessions without a side-agent-link were not created by this extension
 		// (e.g. pi run manually inside a slot); don't offer them as side-agents.
-		if (!scanned.agentId || !scanned.hasMessage) continue;
+		if (!scanned.agentId || scanned.messageCount === 0) continue;
 		// An agent id maps to one branch; only the newest inactive session per id
 		// may reattach it — others resume onto a fresh branch instead.
 		const branchHeldElsewhere = seenAgentIds.has(scanned.agentId);
@@ -1931,6 +1987,8 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 			path: file.path,
 			sessionCwd: scanned.sessionCwd,
 			modified: file.modified,
+			created: sessionCreatedFromFilename(file.path) ?? file.modified,
+			messageCount: scanned.messageCount,
 			name: scanned.name,
 			firstMessage: scanned.firstMessage,
 			agentId: scanned.agentId,
@@ -1940,6 +1998,41 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 		});
 	}
 	return out;
+}
+
+/** Parse the creation timestamp from pi's session filename (best effort). */
+function sessionCreatedFromFilename(sessionPath: string): Date | undefined {
+	const match = basename(sessionPath).match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
+	if (!match) return undefined;
+	const date = new Date(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`);
+	return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function resumeBranchNote(candidate: ResumableSession): string {
+	if (candidate.branch) {
+		return candidate.branchExists ? "" : "[branch pruned; will recreate from HEAD]";
+	}
+	return "[branch owned by another session; will use fresh branch]";
+}
+
+/** Present a resumable session as a SessionInfo for pi's own session-selector widget. */
+function toSessionInfo(candidate: ResumableSession): SessionInfo {
+	const note = resumeBranchNote(candidate);
+	const baseName = candidate.name ? `${candidate.name} · ${candidate.agentId}` : candidate.agentId;
+	return {
+		path: candidate.path,
+		id: basename(candidate.path).replace(/\.jsonl$/, ""),
+		cwd: candidate.sessionCwd ?? "",
+		name: note ? `${baseName} ${note}` : baseName,
+		parentSessionPath: undefined,
+		created: candidate.created,
+		modified: candidate.modified,
+		messageCount: candidate.messageCount,
+		firstMessage: candidate.firstMessage ?? "",
+		allMessagesText: [candidate.agentId, candidate.branch, candidate.name, candidate.firstMessage]
+			.filter(Boolean)
+			.join(" "),
+	};
 }
 
 function formatRelativeAge(date: Date): string {
@@ -2805,7 +2898,13 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("agent-resume", {
 		description: "Resume a previously /quit side-agent session (with its branch) in a worktree/tmux window",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
+			if (args.trim()) {
+				const message =
+					"/agent-resume takes no arguments; resumed sessions reopen idle — steer them in their tmux window or via agent-send.";
+				ctx.hasUI ? ctx.ui.notify(message, "error") : console.log(message);
+				return;
+			}
 			if (!ctx.hasUI) {
 				console.log("/agent-resume requires an interactive UI (session picker).");
 				return;
@@ -2826,10 +2925,40 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const labels = candidates.map((candidate, index) => formatResumeCandidate(candidate, index));
-			const choice = await ctx.ui.select("Resume side-agent session", labels);
-			if (choice === undefined) return;
-			const candidate = candidates[labels.indexOf(choice)];
+			let chosenPath: string | undefined;
+			if (ctx.mode === "tui") {
+				// Reuse pi's own session-selector widget (same as --resume): paginated,
+				// searchable, sortable — unlike the simple ui.select list.
+				const infos = candidates.map((candidate) => toSessionInfo(candidate));
+				const loader = async () => infos;
+				chosenPath = await ctx.ui.custom<string | undefined>((tui, _theme, keybindings, done) => {
+					return new SessionSelectorComponent(
+						loader,
+						loader,
+						(sessionPath) => done(sessionPath),
+						() => done(undefined),
+						() => done(undefined),
+						() => tui.requestRender(),
+						{
+							renameSession: async (sessionFilePath, nextName) => {
+								const next = (nextName ?? "").trim();
+								if (!next) return;
+								const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+								SessionManager.open(sessionFilePath).appendSessionInfo(next);
+							},
+							showRenameHint: true,
+							keybindings,
+						},
+					);
+				});
+			} else {
+				const labels = candidates.map((candidate, index) => formatResumeCandidate(candidate, index));
+				const choice = await ctx.ui.select("Resume side-agent session", labels);
+				if (choice === undefined) return;
+				chosenPath = candidates[labels.indexOf(choice)]?.path;
+			}
+			if (!chosenPath) return;
+			const candidate = candidates.find((c) => c.path === chosenPath);
 			if (!candidate) return;
 
 			const taskPreview = candidate.name || candidate.firstMessage || "(resumed session)";
