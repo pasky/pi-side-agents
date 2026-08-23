@@ -145,6 +145,17 @@ type StatusTransitionNotice = {
 	tmuxWindowIndex?: number;
 };
 
+/**
+ * A transition notice buffered for delivery. Consecutive transitions of the same
+ * agent collapse into one entry (`fromStatus` of the first, `toStatus` of the
+ * latest) so a late burst of historical flip-flopping is reported once.
+ */
+type PendingStatusTransition = StatusTransitionNotice & {
+	firstObservedAt: number;
+	lastObservedAt: number;
+	coalescedCount: number;
+};
+
 type AgentStatusSnapshot = {
 	status: AgentStatus;
 	tmuxWindowIndex?: number;
@@ -155,6 +166,10 @@ let statusPollContext: ExtensionContext | undefined;
 let statusPollApi: ExtensionAPI | undefined;
 let statusPollInFlight = false;
 const statusSnapshotsByStateRoot = new Map<string, Map<string, AgentStatusSnapshot>>();
+const pendingTransitionsByStateRoot = new Map<string, Map<string, PendingStatusTransition>>();
+// Transitions settle for this long before being reported, so short-lived
+// intermediate states (spawning_tmux -> running -> waiting_user) coalesce.
+const TRANSITION_SETTLE_MS = 5000;
 let lastRenderedStatusLine: string | undefined;
 
 function nowIso() {
@@ -2688,45 +2703,120 @@ function formatLabelPrefix(prefix: string, theme?: ThemeForeground): string {
 	return theme.fg("muted", prefix);
 }
 
-function formatStatusTransitionMessage(transition: StatusTransitionNotice, theme?: ThemeForeground): string {
+function formatStatusTransitionMessage(transition: PendingStatusTransition, theme?: ThemeForeground): string {
 	// Wall-clock stamp of when the transition was observed: these notices are
-	// delivered as follow-ups at the next turn boundary, which may be minutes
+	// delivered as context at the next turn boundary, which may be minutes
 	// later — without a timestamp a late burst of stale transitions reads like
 	// live flip-flopping.
-	const at = new Date().toTimeString().slice(0, 8);
-	const suffix = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex}, ${at})` : ` (${at})`;
+	const at = new Date(transition.lastObservedAt).toTimeString().slice(0, 8);
+	const parts = [] as string[];
+	if (transition.tmuxWindowIndex !== undefined) parts.push(`tmux #${transition.tmuxWindowIndex}`);
+	parts.push(at);
+	if (transition.coalescedCount > 1) parts.push(`${transition.coalescedCount} transitions coalesced`);
 	const from = formatStatusWord(transition.fromStatus, theme);
 	const to = formatStatusWord(transition.toStatus, theme);
-	return `side-agent ${transition.id}: ${from} -> ${to}${suffix}`;
+	return `side-agent ${transition.id}: ${from} -> ${to} (${parts.join(", ")})`;
 }
 
-function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transitions: StatusTransitionNotice[]): void {
+/**
+ * Fold freshly observed transitions into the pending buffer, collapsing repeated
+ * transitions of the same agent into a single first-from/latest-to notice.
+ */
+function mergePendingTransitions(
+	pending: Map<string, PendingStatusTransition>,
+	transitions: StatusTransitionNotice[],
+	now: number,
+): void {
+	for (const transition of transitions) {
+		const existing = pending.get(transition.id);
+		if (!existing) {
+			pending.set(transition.id, {
+				...transition,
+				firstObservedAt: now,
+				lastObservedAt: now,
+				coalescedCount: 1,
+			});
+			continue;
+		}
+		existing.toStatus = transition.toStatus;
+		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
+		existing.lastObservedAt = now;
+		existing.coalescedCount += 1;
+	}
+}
+
+/**
+ * Take the pending notices that are ready for delivery: terminal states flush
+ * at once (nothing can follow them, and the registry entry is already gone, so
+ * holding them back only risks losing the final notice), everything else waits
+ * out TRANSITION_SETTLE_MS of quiet. Round-trips that ended where they started
+ * are dropped entirely — there is nothing to report.
+ */
+function drainSettledTransitions(
+	pending: Map<string, PendingStatusTransition>,
+	now: number,
+	settleMs = TRANSITION_SETTLE_MS,
+): PendingStatusTransition[] {
+	const settled: PendingStatusTransition[] = [];
+	for (const [agentId, entry] of pending.entries()) {
+		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
+		if (!ready) continue;
+		pending.delete(agentId);
+		if (entry.fromStatus === entry.toStatus) continue;
+		settled.push(entry);
+	}
+	return settled.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoot: string, transitions: StatusTransitionNotice[]): void {
 	if (isChildRuntime()) return;
 
-	for (const transition of transitions) {
-		const message = formatStatusTransitionMessage(transition, ctx.hasUI ? ctx.ui.theme : undefined);
+	let pending = pendingTransitionsByStateRoot.get(stateRoot);
+	if (!pending) {
+		pending = new Map();
+		pendingTransitionsByStateRoot.set(stateRoot, pending);
+	}
+
+	const now = Date.now();
+	mergePendingTransitions(pending, transitions, now);
+
+	// Hard failures are actionable right away — toast them live even though the
+	// conversational notice is still settling.
+	if (ctx.hasUI) {
+		for (const transition of transitions) {
+			if (transition.toStatus !== "failed" && transition.toStatus !== "crashed") continue;
+			ctx.ui.notify(
+				`side-agent ${transition.id}: ${transition.fromStatus} -> ${transition.toStatus}`,
+				"error",
+			);
+		}
+	}
+
+	for (const transition of drainSettledTransitions(pending, now)) {
 		pi.sendMessage(
 			{
 				customType: STATUS_UPDATE_MESSAGE_TYPE,
-				content: message,
+				content: formatStatusTransitionMessage(transition, ctx.hasUI ? ctx.ui.theme : undefined),
 				display: true,
 				details: {
 					agentId: transition.id,
 					fromStatus: transition.fromStatus,
 					toStatus: transition.toStatus,
 					tmuxWindowIndex: transition.tmuxWindowIndex,
+					coalescedCount: transition.coalescedCount,
+					observedAt: transition.lastObservedAt,
 					emittedAt: Date.now(),
 				},
 			},
 			{
+				// "nextTurn" queues the notice as context alongside the next user
+				// prompt: no turn of its own (unlike "followUp", which drains one
+				// queued message per turn and spams the conversation) and no
+				// mid-stream injection (unlike the default "steer").
 				triggerTurn: false,
-				deliverAs: "followUp",
+				deliverAs: "nextTurn",
 			},
 		);
-
-		if (ctx.hasUI && (transition.toStatus === "failed" || transition.toStatus === "crashed")) {
-			ctx.ui.notify(message, "error");
-		}
 	}
 }
 
@@ -2760,10 +2850,9 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 	const agents = Object.values(refreshed.agents).sort((a, b) => a.id.localeCompare(b.id));
 
 	if (options?.emitTransitions ?? true) {
-		const transitions = collectStatusTransitions(stateRoot, agents);
-		if (transitions.length > 0) {
-			emitStatusTransitions(pi, ctx, transitions);
-		}
+		// Always call through, even with no new transitions: buffered notices need
+		// a later tick to settle and flush.
+		emitStatusTransitions(pi, ctx, stateRoot, collectStatusTransitions(stateRoot, agents));
 	} else if (!statusSnapshotsByStateRoot.has(stateRoot)) {
 		collectStatusTransitions(stateRoot, agents);
 	}

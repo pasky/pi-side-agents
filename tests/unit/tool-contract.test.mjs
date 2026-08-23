@@ -233,6 +233,53 @@ function collectStatusTransitions(previous, agents) {
 	};
 }
 
+const TRANSITION_SETTLE_MS = 5000;
+
+/**
+ * Re-implementation of pending-transition coalescing used before delivery.
+ *
+ * @param {Map<string, any>} pending
+ * @param {Array<{ id: string, fromStatus: string, toStatus: string, tmuxWindowIndex?: number }>} transitions
+ * @param {number} now
+ */
+function mergePendingTransitions(pending, transitions, now) {
+	for (const transition of transitions) {
+		const existing = pending.get(transition.id);
+		if (!existing) {
+			pending.set(transition.id, {
+				...transition,
+				firstObservedAt: now,
+				lastObservedAt: now,
+				coalescedCount: 1,
+			});
+			continue;
+		}
+		existing.toStatus = transition.toStatus;
+		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
+		existing.lastObservedAt = now;
+		existing.coalescedCount += 1;
+	}
+}
+
+/**
+ * Re-implementation of settled-transition draining.
+ *
+ * @param {Map<string, any>} pending
+ * @param {number} now
+ * @param {number} settleMs
+ */
+function drainSettledTransitions(pending, now, settleMs = TRANSITION_SETTLE_MS) {
+	const settled = [];
+	for (const [agentId, entry] of pending.entries()) {
+		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
+		if (!ready) continue;
+		pending.delete(agentId);
+		if (entry.fromStatus === entry.toStatus) continue;
+		settled.push(entry);
+	}
+	return settled.sort((a, b) => a.id.localeCompare(b.id));
+}
+
 // ---------------------------------------------------------------------------
 // Helper: temporary registry factory
 // ---------------------------------------------------------------------------
@@ -499,6 +546,62 @@ test("collectStatusTransitions — removed terminal agent does not emit syntheti
 
 	const { transitions } = collectStatusTransitions(previous, []);
 	assert.deepEqual(transitions, []);
+});
+
+test("pending transitions — a burst collapses into one first->last notice", () => {
+	const pending = new Map();
+	const t0 = 1_000_000;
+	mergePendingTransitions(pending, [{ id: "alpha", fromStatus: "spawning_tmux", toStatus: "running", tmuxWindowIndex: 3 }], t0);
+	mergePendingTransitions(pending, [{ id: "alpha", fromStatus: "running", toStatus: "waiting_user" }], t0 + 2000);
+	mergePendingTransitions(pending, [{ id: "alpha", fromStatus: "waiting_user", toStatus: "running" }], t0 + 3000);
+	// Still settling while non-terminal: nothing delivered yet.
+	assert.deepEqual(drainSettledTransitions(pending, t0 + 3500), []);
+
+	mergePendingTransitions(pending, [{ id: "alpha", fromStatus: "running", toStatus: "done" }], t0 + 4000);
+
+	// Terminal state flushes immediately, without waiting out the settle window.
+	const settled = drainSettledTransitions(pending, t0 + 4000);
+	assert.equal(settled.length, 1);
+	assert.equal(settled[0].fromStatus, "spawning_tmux");
+	assert.equal(settled[0].toStatus, "done");
+	assert.equal(settled[0].tmuxWindowIndex, 3);
+	assert.equal(settled[0].coalescedCount, 4);
+	assert.equal(pending.size, 0, "drained entries must not be redelivered");
+});
+
+test("pending transitions — round trip back to the original status is dropped", () => {
+	const pending = new Map();
+	const t0 = 2_000_000;
+	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "running", toStatus: "waiting_user" }], t0);
+	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "waiting_user", toStatus: "running" }], t0 + 500);
+
+	assert.deepEqual(drainSettledTransitions(pending, t0 + 500 + TRANSITION_SETTLE_MS), []);
+	assert.equal(pending.size, 0);
+});
+
+test("pending transitions — distinct agents settle independently and sort by id", () => {
+	const pending = new Map();
+	const t0 = 3_000_000;
+	mergePendingTransitions(pending, [
+		{ id: "zeta", fromStatus: "running", toStatus: "done" },
+		{ id: "alpha", fromStatus: "running", toStatus: "failed" },
+	], t0);
+	const first = drainSettledTransitions(pending, t0);
+	assert.deepEqual(first.map((t) => [t.id, t.fromStatus, t.toStatus]), [
+		["alpha", "running", "failed"],
+		["zeta", "running", "done"],
+	]);
+	assert.equal(pending.size, 0);
+});
+
+test("pending transitions — non-terminal states wait out the settle window", () => {
+	const pending = new Map();
+	const t0 = 4_000_000;
+	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "spawning_tmux", toStatus: "running" }], t0);
+	assert.deepEqual(drainSettledTransitions(pending, t0 + TRANSITION_SETTLE_MS - 1), []);
+
+	const settled = drainSettledTransitions(pending, t0 + TRANSITION_SETTLE_MS);
+	assert.deepEqual(settled.map((t) => [t.id, t.fromStatus, t.toStatus]), [["beta", "spawning_tmux", "running"]]);
 });
 
 test("cleanupWorktreeLockBestEffort — removes existing lock and remains idempotent", async (t) => {
