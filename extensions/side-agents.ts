@@ -1788,6 +1788,8 @@ type ResumableSession = {
 	branchExists: boolean;
 	/** True when the agent id is owned by a newer session or an active agent. */
 	branchHeldElsewhere: boolean;
+	/** Who owns the branch when branchHeldElsewhere is set. */
+	branchHeldBy?: "active-agent" | "newer-session";
 };
 
 /** Resolve pi's agent dir (respects PI_CODING_AGENT_DIR). */
@@ -2010,6 +2012,11 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 		const branchHeldElsewhere = seenAgentIds.has(scanned.agentId);
 		seenAgentIds.add(scanned.agentId);
 		const branch = branchHeldElsewhere ? undefined : `side-agent/${scanned.agentId}`;
+		const branchHeldBy = branchHeldElsewhere
+			? registry.agents[scanned.agentId]
+				? ("active-agent" as const)
+				: ("newer-session" as const)
+			: undefined;
 		out.push({
 			path: file.path,
 			sessionCwd: scanned.sessionCwd,
@@ -2022,6 +2029,7 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 			branch,
 			branchExists: branch ? branchRefs.has(branch) : false,
 			branchHeldElsewhere,
+			branchHeldBy,
 		});
 	}
 	return out;
@@ -2039,7 +2047,9 @@ function resumeBranchNote(candidate: ResumableSession): string {
 	if (candidate.branch) {
 		return candidate.branchExists ? "" : "[branch pruned; will recreate from HEAD]";
 	}
-	return "[branch owned by another session; will use fresh branch]";
+	return candidate.branchHeldBy === "active-agent"
+		? "[branch held by ACTIVE agent; will use fresh branch]"
+		: "[branch owned by a newer session above; will use fresh branch]";
 }
 
 /** The name-or-preview body shown for a candidate (without id/branch decorations). */
