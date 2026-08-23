@@ -2746,17 +2746,24 @@ function mergePendingTransitions(
 }
 
 /**
- * Take the pending notices that are ready for delivery: terminal states flush
- * at once (nothing can follow them, and the registry entry is already gone, so
- * holding them back only risks losing the final notice), everything else waits
- * out TRANSITION_SETTLE_MS of quiet. Round-trips that ended where they started
- * are dropped entirely — there is nothing to report.
+ * Take the pending notices that are ready for delivery: terminal states are
+ * ready at once (nothing can follow a done/failed/crashed agent, so waiting
+ * buys nothing), everything else waits out TRANSITION_SETTLE_MS of quiet.
+ * Round-trips that ended where they started are dropped entirely — there is
+ * nothing to report.
+ *
+ * Nothing leaves the buffer while the parent is busy (`idle === false`): the
+ * only delivery mode that both persists the notice and spawns no turn of its
+ * own requires an idle session, and holding entries back keeps coalescing them
+ * for the whole busy stretch instead of piling up a stale backlog.
  */
 function drainSettledTransitions(
 	pending: Map<string, PendingStatusTransition>,
 	now: number,
+	idle = true,
 	settleMs = TRANSITION_SETTLE_MS,
 ): PendingStatusTransition[] {
+	if (!idle) return [];
 	const settled: PendingStatusTransition[] = [];
 	for (const [agentId, entry] of pending.entries()) {
 		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
@@ -2780,6 +2787,13 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoo
 	const now = Date.now();
 	mergePendingTransitions(pending, transitions, now);
 
+	// Only deliver between turns. Delivering mid-stream would either inject a
+	// status update into the running loop ("steer") or queue one turn per notice
+	// ("followUp") — the latter is what made a finished agent replay its whole
+	// history as a chain of turns. The poller retries every couple of seconds,
+	// so buffered notices land shortly after the current turn ends.
+	const deliverable = drainSettledTransitions(pending, now, ctx.isIdle());
+
 	// Hard failures are actionable right away — toast them live even though the
 	// conversational notice is still settling.
 	if (ctx.hasUI) {
@@ -2792,7 +2806,7 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoo
 		}
 	}
 
-	for (const transition of drainSettledTransitions(pending, now)) {
+	for (const transition of deliverable) {
 		pi.sendMessage(
 			{
 				customType: STATUS_UPDATE_MESSAGE_TYPE,
@@ -2804,17 +2818,17 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoo
 					toStatus: transition.toStatus,
 					tmuxWindowIndex: transition.tmuxWindowIndex,
 					coalescedCount: transition.coalescedCount,
+					firstObservedAt: transition.firstObservedAt,
 					observedAt: transition.lastObservedAt,
 					emittedAt: Date.now(),
 				},
 			},
 			{
-				// "nextTurn" queues the notice as context alongside the next user
-				// prompt: no turn of its own (unlike "followUp", which drains one
-				// queued message per turn and spams the conversation) and no
-				// mid-stream injection (unlike the default "steer").
+				// Idle + no triggerTurn: the runtime appends the notice to the
+				// session and to the message state right away — persisted, shown
+				// in the transcript, visible to the model on the next turn, and
+				// no turn spawned for it.
 				triggerTurn: false,
-				deliverAs: "nextTurn",
 			},
 		);
 	}

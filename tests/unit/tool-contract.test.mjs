@@ -266,9 +266,11 @@ function mergePendingTransitions(pending, transitions, now) {
  *
  * @param {Map<string, any>} pending
  * @param {number} now
+ * @param {boolean} idle
  * @param {number} settleMs
  */
-function drainSettledTransitions(pending, now, settleMs = TRANSITION_SETTLE_MS) {
+function drainSettledTransitions(pending, now, idle = true, settleMs = TRANSITION_SETTLE_MS) {
+	if (!idle) return [];
 	const settled = [];
 	for (const [agentId, entry] of pending.entries()) {
 		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
@@ -602,6 +604,25 @@ test("pending transitions — non-terminal states wait out the settle window", (
 
 	const settled = drainSettledTransitions(pending, t0 + TRANSITION_SETTLE_MS);
 	assert.deepEqual(settled.map((t) => [t.id, t.fromStatus, t.toStatus]), [["beta", "spawning_tmux", "running"]]);
+});
+
+test("pending transitions — nothing is delivered while the parent is busy, and it keeps coalescing", () => {
+	const pending = new Map();
+	const t0 = 5_000_000;
+	mergePendingTransitions(pending, [{ id: "gamma", fromStatus: "spawning_tmux", toStatus: "running", tmuxWindowIndex: 9 }], t0);
+
+	// Busy: even a settled, terminal notice stays buffered rather than being
+	// queued as its own turn.
+	assert.deepEqual(drainSettledTransitions(pending, t0 + 10 * TRANSITION_SETTLE_MS, false), []);
+	mergePendingTransitions(pending, [{ id: "gamma", fromStatus: "running", toStatus: "done" }], t0 + 60_000);
+	assert.deepEqual(drainSettledTransitions(pending, t0 + 60_000, false), []);
+	assert.equal(pending.size, 1, "buffered notice must survive until it can be delivered");
+
+	// Idle again: the whole busy stretch arrives as a single notice.
+	const settled = drainSettledTransitions(pending, t0 + 61_000, true);
+	assert.deepEqual(settled.map((t) => [t.id, t.fromStatus, t.toStatus, t.coalescedCount]), [
+		["gamma", "spawning_tmux", "done", 2],
+	]);
 });
 
 test("cleanupWorktreeLockBestEffort — removes existing lock and remains idempotent", async (t) => {
