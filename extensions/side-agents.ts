@@ -2042,20 +2042,35 @@ function resumeBranchNote(candidate: ResumableSession): string {
 	return "[branch owned by another session; will use fresh branch]";
 }
 
+/** The name-or-preview body shown for a candidate (without id/branch decorations). */
+function resumePreviewBody(candidate: ResumableSession): string {
+	if (candidate.name) return candidate.name;
+	return truncateWithEllipsis(
+		stripTerminalNoise(candidate.firstMessage ?? "").replace(/\s+/g, " ").trim(),
+		80,
+	);
+}
+
 /**
- * Present a resumable session as a SessionInfo for pi's own session-selector
- * widget. Only the session's REAL name goes into `name` — synthesizing agent
- * id / branch annotations there would hide first-message previews for unnamed
- * sessions and pollute the rename prefill (and a save would persist the
- * synthetic title). Agent id and branch stay searchable via allMessagesText;
- * branch state is reported after selection.
+ * Display string for the picker: the widget shows `name ?? firstMessage` on a
+ * single line, so to keep the agent id and branch state visible we fold the
+ * real name (or kickoff preview) into a synthesized name. The rename callback
+ * strips these decorations again so they are never persisted as a title.
  */
+function synthesizedPickerName(candidate: ResumableSession): string {
+	const body = resumePreviewBody(candidate);
+	const base = body ? `${candidate.agentId} · ${body}` : candidate.agentId;
+	const note = resumeBranchNote(candidate);
+	return note ? `${base} ${note}` : base;
+}
+
+/** Present a resumable session as a SessionInfo for pi's own session-selector widget. */
 function toSessionInfo(candidate: ResumableSession): SessionInfo {
 	return {
 		path: candidate.path,
 		id: basename(candidate.path).replace(/\.jsonl$/, ""),
 		cwd: candidate.sessionCwd ?? "",
-		name: candidate.name,
+		name: synthesizedPickerName(candidate),
 		parentSessionPath: undefined,
 		created: candidate.created,
 		modified: candidate.modified,
@@ -2986,7 +3001,24 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 						() => tui.requestRender(),
 						{
 							renameSession: async (sessionFilePath, nextName) => {
-								const next = (nextName ?? "").trim();
+								let next = (nextName ?? "").trim();
+								if (!next) return;
+								// The prefill is our synthesized picker name; strip the
+								// decorations so they never persist as an actual title.
+								const cand = candidates.find((c) => c.path === sessionFilePath);
+								if (cand) {
+									if (next === synthesizedPickerName(cand)) return; // untouched prefill
+									const note = resumeBranchNote(cand);
+									if (note && next.endsWith(note)) {
+										next = next.slice(0, -note.length).trim();
+									}
+									if (next.startsWith(`${cand.agentId} · `)) {
+										next = next.slice(cand.agentId.length + 3).trim();
+									}
+									if (!next || next === cand.agentId) return;
+									if (cand.name && next === cand.name) return; // unchanged real name
+									if (!cand.name && next === resumePreviewBody(cand)) return; // preview left as-is
+								}
 								if (!next) return;
 								SessionManager.open(sessionFilePath).appendSessionInfo(next);
 							},
