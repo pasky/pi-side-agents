@@ -234,6 +234,7 @@ function collectStatusTransitions(previous, agents) {
 }
 
 const TRANSITION_SETTLE_MS = 5000;
+const TRANSITION_PATH_LIMIT = 6;
 
 /**
  * Re-implementation of pending-transition coalescing used before delivery.
@@ -251,6 +252,7 @@ function mergePendingTransitions(pending, transitions, now) {
 				firstObservedAt: now,
 				lastObservedAt: now,
 				coalescedCount: 1,
+				path: [transition.toStatus],
 			});
 			continue;
 		}
@@ -258,6 +260,11 @@ function mergePendingTransitions(pending, transitions, now) {
 		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
 		existing.lastObservedAt = now;
 		existing.coalescedCount += 1;
+		if (existing.path.length < TRANSITION_PATH_LIMIT) {
+			existing.path.push(transition.toStatus);
+		} else {
+			existing.path[existing.path.length - 1] = transition.toStatus;
+		}
 	}
 }
 
@@ -276,7 +283,6 @@ function drainSettledTransitions(pending, now, idle = true, settleMs = TRANSITIO
 		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
 		if (!ready) continue;
 		pending.delete(agentId);
-		if (entry.fromStatus === entry.toStatus) continue;
 		settled.push(entry);
 	}
 	return settled.sort((a, b) => a.id.localeCompare(b.id));
@@ -571,14 +577,38 @@ test("pending transitions — a burst collapses into one first->last notice", ()
 	assert.equal(pending.size, 0, "drained entries must not be redelivered");
 });
 
-test("pending transitions — round trip back to the original status is dropped", () => {
+test("pending transitions — a cycle is still reported, with its route", () => {
+	// waiting_user -> running -> waiting_user means the child completed another
+	// requested iteration; identical endpoints must not swallow the notice.
 	const pending = new Map();
 	const t0 = 2_000_000;
-	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "running", toStatus: "waiting_user" }], t0);
-	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "waiting_user", toStatus: "running" }], t0 + 500);
+	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "waiting_user", toStatus: "running" }], t0);
+	mergePendingTransitions(pending, [{ id: "beta", fromStatus: "running", toStatus: "waiting_user" }], t0 + 500);
 
-	assert.deepEqual(drainSettledTransitions(pending, t0 + 500 + TRANSITION_SETTLE_MS), []);
+	const settled = drainSettledTransitions(pending, t0 + 500 + TRANSITION_SETTLE_MS);
+	assert.equal(settled.length, 1);
+	assert.equal(settled[0].fromStatus, "waiting_user");
+	assert.equal(settled[0].toStatus, "waiting_user");
+	assert.deepEqual(settled[0].path, ["running", "waiting_user"]);
 	assert.equal(pending.size, 0);
+});
+
+test("pending transitions — long flip-flop keeps the path capped with the latest status last", () => {
+	const pending = new Map();
+	const t0 = 6_000_000;
+	const statuses = ["running", "waiting_user", "running", "waiting_user", "running", "waiting_user", "running", "done"];
+	let from = "spawning_tmux";
+	statuses.forEach((to, i) => {
+		mergePendingTransitions(pending, [{ id: "delta", fromStatus: from, toStatus: to }], t0 + i);
+		from = to;
+	});
+
+	const entry = pending.get("delta");
+	assert.equal(entry.fromStatus, "spawning_tmux", "the origin status must survive coalescing");
+	assert.equal(entry.toStatus, "done");
+	assert.equal(entry.path.length, TRANSITION_PATH_LIMIT);
+	assert.equal(entry.path.at(-1), "done");
+	assert.equal(entry.coalescedCount, statuses.length);
 });
 
 test("pending transitions — distinct agents settle independently and sort by id", () => {

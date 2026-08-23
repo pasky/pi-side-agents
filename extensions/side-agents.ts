@@ -154,6 +154,8 @@ type PendingStatusTransition = StatusTransitionNotice & {
 	firstObservedAt: number;
 	lastObservedAt: number;
 	coalescedCount: number;
+	/** Statuses entered since `fromStatus`, oldest first (capped). */
+	path: AgentStatus[];
 };
 
 type AgentStatusSnapshot = {
@@ -170,6 +172,8 @@ const pendingTransitionsByStateRoot = new Map<string, Map<string, PendingStatusT
 // Transitions settle for this long before being reported, so short-lived
 // intermediate states (spawning_tmux -> running -> waiting_user) coalesce.
 const TRANSITION_SETTLE_MS = 5000;
+// Cap on remembered intermediate states of a coalesced notice.
+const TRANSITION_PATH_LIMIT = 6;
 let lastRenderedStatusLine: string | undefined;
 
 function nowIso() {
@@ -2713,9 +2717,16 @@ function formatStatusTransitionMessage(transition: PendingStatusTransition, them
 	if (transition.tmuxWindowIndex !== undefined) parts.push(`tmux #${transition.tmuxWindowIndex}`);
 	parts.push(at);
 	if (transition.coalescedCount > 1) parts.push(`${transition.coalescedCount} transitions coalesced`);
-	const from = formatStatusWord(transition.fromStatus, theme);
-	const to = formatStatusWord(transition.toStatus, theme);
-	return `side-agent ${transition.id}: ${from} -> ${to} (${parts.join(", ")})`;
+
+	// A cycle (waiting_user -> running -> waiting_user) has identical endpoints
+	// but is real news — the child did another round of work. Spell out the
+	// route in that case so it does not read as a no-op.
+	const statuses =
+		transition.fromStatus === transition.toStatus
+			? [transition.fromStatus, ...transition.path]
+			: [transition.fromStatus, transition.toStatus];
+	const route = statuses.map((status) => formatStatusWord(status, theme)).join(" -> ");
+	return `side-agent ${transition.id}: ${route} (${parts.join(", ")})`;
 }
 
 /**
@@ -2735,6 +2746,7 @@ function mergePendingTransitions(
 				firstObservedAt: now,
 				lastObservedAt: now,
 				coalescedCount: 1,
+				path: [transition.toStatus],
 			});
 			continue;
 		}
@@ -2742,6 +2754,14 @@ function mergePendingTransitions(
 		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
 		existing.lastObservedAt = now;
 		existing.coalescedCount += 1;
+		if (existing.path.length < TRANSITION_PATH_LIMIT) {
+			existing.path.push(transition.toStatus);
+		} else {
+			// Keep the oldest steps and the latest one; the middle of a long
+			// flip-flop carries no extra information (coalescedCount already says
+			// how many steps there really were).
+			existing.path[existing.path.length - 1] = transition.toStatus;
+		}
 	}
 }
 
@@ -2749,8 +2769,12 @@ function mergePendingTransitions(
  * Take the pending notices that are ready for delivery: terminal states are
  * ready at once (nothing can follow a done/failed/crashed agent, so waiting
  * buys nothing), everything else waits out TRANSITION_SETTLE_MS of quiet.
- * Round-trips that ended where they started are dropped entirely — there is
- * nothing to report.
+ *
+ * Notices whose endpoints match are still reported: collectStatusTransitions()
+ * never produces a no-op, so identical endpoints mean the agent went somewhere
+ * and came back (typically waiting_user -> running -> waiting_user, i.e. it
+ * completed another requested iteration) — dropping those would silently hide
+ * finished work.
  *
  * Nothing leaves the buffer while the parent is busy (`idle === false`): the
  * only delivery mode that both persists the notice and spawns no turn of its
@@ -2769,13 +2793,18 @@ function drainSettledTransitions(
 		const ready = isTerminalStatus(entry.toStatus) || now - entry.lastObservedAt >= settleMs;
 		if (!ready) continue;
 		pending.delete(agentId);
-		if (entry.fromStatus === entry.toStatus) continue;
 		settled.push(entry);
 	}
 	return settled.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoot: string, transitions: StatusTransitionNotice[]): void {
+function emitStatusTransitions(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	stateRoot: string,
+	transitions: StatusTransitionNotice[],
+	settleMs = TRANSITION_SETTLE_MS,
+): void {
 	if (isChildRuntime()) return;
 
 	let pending = pendingTransitionsByStateRoot.get(stateRoot);
@@ -2792,7 +2821,14 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, stateRoo
 	// ("followUp") — the latter is what made a finished agent replay its whole
 	// history as a chain of turns. The poller retries every couple of seconds,
 	// so buffered notices land shortly after the current turn ends.
-	const deliverable = drainSettledTransitions(pending, now, ctx.isIdle());
+	//
+	// isIdle() is `!isStreaming`, which is also briefly true in the gaps between
+	// continuations (retry, auto-compaction) inside one logical turn. That is an
+	// acceptable gate: the worst case there is a plain context message landing a
+	// continuation early — no extra turn, no steering. Gating additionally on our
+	// own agent_start/agent_end bookkeeping would risk wedging notifications
+	// forever if an agent_end is ever missed.
+	const deliverable = drainSettledTransitions(pending, now, ctx.isIdle(), settleMs);
 
 	// Hard failures are actionable right away — toast them live even though the
 	// conversational notice is still settling.
@@ -3367,6 +3403,13 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
 		ensureStatusPoller(pi, ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// Last chance to persist buffered notices: skip the settle window so a
+		// still-quiet transition is not lost with the process.
+		if (isChildRuntime()) return;
+		emitStatusTransitions(pi, ctx, getStateRoot(ctx), [], 0);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
