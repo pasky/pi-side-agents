@@ -2048,8 +2048,8 @@ function resumeBranchNote(candidate: ResumableSession): string {
 		return candidate.branchExists ? "" : "[branch pruned; will recreate from HEAD]";
 	}
 	return candidate.branchHeldBy === "active-agent"
-		? "[branch held by ACTIVE agent; will use fresh branch]"
-		: "[branch owned by a newer session above; will use fresh branch]";
+		? "[branch held by ACTIVE agent → fresh branch]"
+		: "[branch owned by newer session → fresh branch]";
 }
 
 /** The name-or-preview body shown for a candidate (without id/branch decorations). */
@@ -2064,14 +2064,43 @@ function resumePreviewBody(candidate: ResumableSession): string {
 /**
  * Display string for the picker: the widget shows `name ?? firstMessage` on a
  * single line, so to keep the agent id and branch state visible we fold the
- * real name (or kickoff preview) into a synthesized name. The rename callback
- * strips these decorations again so they are never persisted as a title.
+ * real name (or kickoff preview) into a synthesized name. The branch note
+ * precedes the body: rows truncate from the right, so a trailing note would
+ * be invisible on narrow terminals. The rename callback strips these
+ * decorations again so they are never persisted as a title.
+ * (Known trade-off: every row counts as "named" for the widget's ctrl+n
+ * filter and named styling.)
  */
 function synthesizedPickerName(candidate: ResumableSession): string {
-	const body = resumePreviewBody(candidate);
-	const base = body ? `${candidate.agentId} · ${body}` : candidate.agentId;
 	const note = resumeBranchNote(candidate);
-	return note ? `${base} ${note}` : base;
+	const body = resumePreviewBody(candidate);
+	const parts = [candidate.agentId];
+	if (note) parts.push(note);
+	if (body) parts.push(`· ${body}`);
+	return parts.join(" ");
+}
+
+/**
+ * Strip picker-name decorations from a rename submission; returns the title
+ * to persist, or undefined when the rename should be a no-op. Decorations are
+ * removed wherever they appear, not only at the boundaries — the rename
+ * input's cursor may start at position 0, so typing X into the prefill
+ * produces e.g. "Xid [note] · Old", which must sanitize to "XOld".
+ */
+function sanitizeRenameTitle(candidate: ResumableSession, input: string): string | undefined {
+	let next = input.trim();
+	if (!next) return undefined;
+	if (next === synthesizedPickerName(candidate)) return undefined; // untouched prefill
+	const note = resumeBranchNote(candidate);
+	if (note) next = next.split(note).join(" ");
+	next = next.replace(/\s+/g, " ").trim();
+	const prefix = `${candidate.agentId} · `;
+	if (next.includes(prefix)) next = next.split(prefix).join("");
+	next = next.replace(/\s+/g, " ").trim();
+	if (!next || next === candidate.agentId) return undefined;
+	if (candidate.name && next === candidate.name) return undefined; // unchanged real name
+	if (!candidate.name && next === resumePreviewBody(candidate)) return undefined; // preview left as-is
+	return next;
 }
 
 /** Present a resumable session as a SessionInfo for pi's own session-selector widget. */
@@ -2105,12 +2134,8 @@ function formatResumeCandidate(candidate: ResumableSession, index: number): stri
 		stripTerminalNoise(candidate.name || candidate.firstMessage || "(untitled session)").replace(/\s+/g, " ").trim(),
 		60,
 	);
-	const branchNote = candidate.branch
-		? candidate.branchExists
-			? ""
-			: " [branch pruned; will recreate from HEAD]"
-		: " [branch owned by another session; will use fresh branch]";
-	return `${index + 1}. ${candidate.agentId} · ${formatRelativeAge(candidate.modified)} ago · ${preview}${branchNote}`;
+	const note = resumeBranchNote(candidate);
+	return `${index + 1}. ${candidate.agentId}${note ? ` ${note}` : ""} · ${formatRelativeAge(candidate.modified)} ago · ${preview}`;
 }
 
 function normalizeAgentId(raw: string): string {
@@ -3011,26 +3036,14 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 						() => tui.requestRender(),
 						{
 							renameSession: async (sessionFilePath, nextName) => {
-								let next = (nextName ?? "").trim();
-								if (!next) return;
-								// The prefill is our synthesized picker name; strip the
-								// decorations so they never persist as an actual title.
+								// The prefill is our synthesized picker name; without candidate
+								// metadata we cannot strip the decorations — refuse rather than
+								// persist a synthetic title.
 								const cand = candidates.find((c) => c.path === sessionFilePath);
-								if (cand) {
-									if (next === synthesizedPickerName(cand)) return; // untouched prefill
-									const note = resumeBranchNote(cand);
-									if (note && next.endsWith(note)) {
-										next = next.slice(0, -note.length).trim();
-									}
-									if (next.startsWith(`${cand.agentId} · `)) {
-										next = next.slice(cand.agentId.length + 3).trim();
-									}
-									if (!next || next === cand.agentId) return;
-									if (cand.name && next === cand.name) return; // unchanged real name
-									if (!cand.name && next === resumePreviewBody(cand)) return; // preview left as-is
-								}
-								if (!next) return;
-								SessionManager.open(sessionFilePath).appendSessionInfo(next);
+								if (!cand) return;
+								const title = sanitizeRenameTitle(cand, nextName ?? "");
+								if (!title) return;
+								SessionManager.open(sessionFilePath).appendSessionInfo(title);
 							},
 							showRenameHint: true,
 							keybindings,

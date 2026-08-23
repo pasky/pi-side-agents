@@ -1030,3 +1030,79 @@ test("assignResumeBranches — active agent ids block branch reattachment", () =
 		{ agentId: "add-retry", branch: "side-agent/add-retry", branchHeldElsewhere: false },
 	]);
 });
+
+// ---------------------------------------------------------------------------
+// 7. /agent-resume picker-name rename sanitizer (contract copies)
+// ---------------------------------------------------------------------------
+
+function resumeBranchNotePort(c) {
+	if (c.branch) return c.branchExists ? "" : "[branch pruned; will recreate from HEAD]";
+	return c.branchHeldBy === "active-agent"
+		? "[branch held by ACTIVE agent → fresh branch]"
+		: "[branch owned by newer session → fresh branch]";
+}
+
+function resumePreviewBodyPort(c) {
+	if (c.name) return c.name;
+	return truncateWithEllipsis(stripTerminalNoise(c.firstMessage ?? "").replace(/\s+/g, " ").trim(), 80);
+}
+
+function synthesizedPickerNamePort(c) {
+	const note = resumeBranchNotePort(c);
+	const body = resumePreviewBodyPort(c);
+	const parts = [c.agentId];
+	if (note) parts.push(note);
+	if (body) parts.push(`· ${body}`);
+	return parts.join(" ");
+}
+
+function sanitizeRenameTitlePort(c, input) {
+	let next = input.trim();
+	if (!next) return undefined;
+	if (next === synthesizedPickerNamePort(c)) return undefined;
+	const note = resumeBranchNotePort(c);
+	if (note) next = next.split(note).join(" ");
+	next = next.replace(/\s+/g, " ").trim();
+	const prefix = `${c.agentId} · `;
+	if (next.includes(prefix)) next = next.split(prefix).join("");
+	next = next.replace(/\s+/g, " ").trim();
+	if (!next || next === c.agentId) return undefined;
+	if (c.name && next === c.name) return undefined;
+	if (!c.name && next === resumePreviewBodyPort(c)) return undefined;
+	return next;
+}
+
+const NAMED = { agentId: "fix-auth", name: "Old", branch: "side-agent/fix-auth", branchExists: true };
+const UNNAMED_HELD = { agentId: "fix-auth", firstMessage: "fix the auth leak", branchHeldBy: "newer-session" };
+
+test("sanitizeRenameTitle — untouched prefill is a no-op", () => {
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, synthesizedPickerNamePort(NAMED)), undefined);
+	assert.strictEqual(sanitizeRenameTitlePort(UNNAMED_HELD, synthesizedPickerNamePort(UNNAMED_HELD)), undefined);
+});
+
+test("sanitizeRenameTitle — typing at cursor position 0 strips decorations", () => {
+	// prefill "fix-auth · Old", cursor at 0, user types "X"
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "Xfix-auth · Old"), "XOld");
+	// with a branch note in the prefill
+	const prefill = synthesizedPickerNamePort(UNNAMED_HELD);
+	assert.strictEqual(sanitizeRenameTitlePort(UNNAMED_HELD, `X${prefill}`), "Xfix the auth leak");
+});
+
+test("sanitizeRenameTitle — edited body keeps only the user title", () => {
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "fix-auth · New title"), "New title");
+	assert.strictEqual(
+		sanitizeRenameTitlePort(UNNAMED_HELD, "fix-auth [branch owned by newer session → fresh branch] · New title"),
+		"New title",
+	);
+});
+
+test("sanitizeRenameTitle — fresh typed name passes through", () => {
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "My new name"), "My new name");
+});
+
+test("sanitizeRenameTitle — degenerate results are no-ops", () => {
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "fix-auth"), undefined); // bare id
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "fix-auth · Old"), undefined); // unchanged real name
+	assert.strictEqual(sanitizeRenameTitlePort(UNNAMED_HELD, "fix the auth leak"), undefined); // preview as-is
+	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "   "), undefined); // empty
+});
