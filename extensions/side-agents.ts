@@ -1,5 +1,5 @@
 import { complete, completeSimple, getSupportedThinkingLevels, type Message } from "@earendil-works/pi-ai/compat";
-import { convertToLlm, serializeConversation, SessionSelectorComponent } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, serializeConversation, SessionManager, SessionSelectorComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionInfo } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -1876,6 +1876,33 @@ async function readSessionSliceLines(sessionPath: string): Promise<string[] | un
 }
 
 /**
+ * Authoritative (whole-file) link-entry read for a single chosen session.
+ * The sliced scan used for listing can miss a corrected link entry buried in
+ * the omitted middle of a large file; before acting on a selection we must
+ * use the true last link, not the sliced approximation.
+ */
+async function readSessionAgentIdAuthoritative(sessionPath: string): Promise<string | undefined> {
+	let found: string | undefined;
+	try {
+		const raw = await fs.readFile(sessionPath, "utf8");
+		for (const line of raw.split("\n")) {
+			if (!line.includes(`"${CHILD_LINK_ENTRY_TYPE}"`)) continue;
+			try {
+				const entry = JSON.parse(line) as { customType?: string; data?: { agentId?: unknown } };
+				if (entry?.customType === CHILD_LINK_ENTRY_TYPE && typeof entry.data?.agentId === "string") {
+					found = entry.data.agentId;
+				}
+			} catch {
+				// skip unparsable lines
+			}
+		}
+	} catch {
+		// unreadable session file
+	}
+	return found;
+}
+
+/**
  * Single-pass, substring-gated scan of a session file. Unlike
  * SessionManager.list() this does NOT JSON-parse every line of every session
  * (which is prohibitively slow across hundreds of MB of session history);
@@ -2015,15 +2042,20 @@ function resumeBranchNote(candidate: ResumableSession): string {
 	return "[branch owned by another session; will use fresh branch]";
 }
 
-/** Present a resumable session as a SessionInfo for pi's own session-selector widget. */
+/**
+ * Present a resumable session as a SessionInfo for pi's own session-selector
+ * widget. Only the session's REAL name goes into `name` — synthesizing agent
+ * id / branch annotations there would hide first-message previews for unnamed
+ * sessions and pollute the rename prefill (and a save would persist the
+ * synthetic title). Agent id and branch stay searchable via allMessagesText;
+ * branch state is reported after selection.
+ */
 function toSessionInfo(candidate: ResumableSession): SessionInfo {
-	const note = resumeBranchNote(candidate);
-	const baseName = candidate.name ? `${candidate.name} · ${candidate.agentId}` : candidate.agentId;
 	return {
 		path: candidate.path,
 		id: basename(candidate.path).replace(/\.jsonl$/, ""),
 		cwd: candidate.sessionCwd ?? "",
-		name: note ? `${baseName} ${note}` : baseName,
+		name: candidate.name,
 		parentSessionPath: undefined,
 		created: candidate.created,
 		modified: candidate.modified,
@@ -2118,6 +2150,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			};
 		});
 
+		if (params.resume && !resumeBranch) {
+			aggregatedWarnings.push("Resuming on a fresh branch (original branch is owned elsewhere or unknown).");
+		}
 		// Safety: reattach the branch only if we actually got its agent id — if
 		// dedup had to suffix the id (e.g. an active agent owns it), the branch
 		// belongs to that other agent and must not be hijacked.
@@ -2929,8 +2964,18 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			if (ctx.mode === "tui") {
 				// Reuse pi's own session-selector widget (same as --resume): paginated,
 				// searchable, sortable — unlike the simple ui.select list.
-				const infos = candidates.map((candidate) => toSessionInfo(candidate));
-				const loader = async () => infos;
+				// First load serves the pre-computed candidates; refresh calls (after
+				// the widget's rename/delete mutations) re-run discovery so the list
+				// reflects disk truth instead of a stale snapshot.
+				let firstLoad = true;
+				const loader = async () => {
+					if (firstLoad) {
+						firstLoad = false;
+						return candidates.map((candidate) => toSessionInfo(candidate));
+					}
+					candidates = await listResumableSessions(stateRoot, repoRoot);
+					return candidates.map((candidate) => toSessionInfo(candidate));
+				};
 				chosenPath = await ctx.ui.custom<string | undefined>((tui, _theme, keybindings, done) => {
 					return new SessionSelectorComponent(
 						loader,
@@ -2943,7 +2988,6 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 							renameSession: async (sessionFilePath, nextName) => {
 								const next = (nextName ?? "").trim();
 								if (!next) return;
-								const { SessionManager } = await import("@earendil-works/pi-coding-agent");
 								SessionManager.open(sessionFilePath).appendSessionInfo(next);
 							},
 							showRenameHint: true,
@@ -2963,6 +3007,25 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 			const taskPreview = candidate.name || candidate.firstMessage || "(resumed session)";
 
+			// The sliced listing scan may have seen a stale link entry (a corrected
+			// link can sit in the omitted middle of a large file); re-read the chosen
+			// session in full and act on the authoritative id.
+			let agentIdHint = candidate.agentId;
+			let branch = candidate.branch;
+			const authoritativeId = await readSessionAgentIdAuthoritative(candidate.path);
+			if (authoritativeId && authoritativeId !== candidate.agentId) {
+				agentIdHint = authoritativeId;
+				// Reattach only if the true id is not owned by an active agent nor by
+				// a newer candidate session (allocateWorktree's lock checks remain the
+				// final backstop).
+				const registry = await loadRegistry(stateRoot);
+				const ownedByNewerCandidate = candidates.some(
+					(c) => c.path !== candidate.path && c.agentId === authoritativeId && c.modified > candidate.modified,
+				);
+				branch =
+					registry.agents[authoritativeId] || ownedByNewerCandidate ? undefined : `side-agent/${authoritativeId}`;
+			}
+
 			try {
 				ctx.ui.notify("Resuming side-agent…", "info");
 				const started = await startAgent(pi, ctx, {
@@ -2971,8 +3034,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					resume: {
 						sessionPath: candidate.path,
 						sessionCwd: candidate.sessionCwd,
-						agentIdHint: candidate.agentId,
-						branch: candidate.branch,
+						agentIdHint,
+						branch,
 					},
 				});
 
