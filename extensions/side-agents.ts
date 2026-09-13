@@ -22,7 +22,7 @@ const PROMPT_UPDATE_MESSAGE_TYPE = "side-agent-prompt";
 const RESUME_NOTICE_MESSAGE_TYPE = "side-agent-resume-notice";
 /** Runtime-dir file the parent writes when a resumed session is re-homed into
  * a different directory; the child consumes it once on session_start. */
-const RESUME_NOTICE_FILE = "resume-notice.md";
+const RESUME_NOTICE_FILE = "resume-notice.json";
 
 const SUMMARY_SYSTEM_PROMPT = `You are writing a minimal handoff summary for a background coding agent.
 
@@ -2339,21 +2339,29 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 				? "session"
 				: "fork"
 			: undefined;
-		if (params.resume && resumeSessionMode === "fork") {
-			// The conversation history refers to paths under the original cwd; the
-			// child consumes this file on session_start and appends a prominent
-			// notice so the model stops targeting the old directory.
-			const notice = buildResumeDirectoryNotice({
-				originalCwd: params.resume.sessionCwd,
-				newCwd: worktree.worktreePath,
-				branch: worktree.branch,
-				branchReattached: worktree.branchReattached,
-			});
-			await atomicWrite(join(runtimeDir, RESUME_NOTICE_FILE), notice);
+		if (params.resume && (resumeSessionMode === "fork" || !worktree.branchReattached)) {
+			// The conversation history refers to paths/state of the original cwd
+			// and branch; when either changed, the child injects a prominent notice
+			// on startup so the model stops acting on stale assumptions.
+			const dirChanged = resumeSessionMode === "fork";
+			const notice: ResumeNoticeFile = {
+				noticeId: `${agentId}:${now}`,
+				targetCwd: worktree.worktreePath,
+				content: buildResumeNotice({
+					dirChanged,
+					originalCwd: params.resume.sessionCwd,
+					newCwd: worktree.worktreePath,
+					branch: worktree.branch,
+					branchReattached: worktree.branchReattached,
+				}),
+			};
+			await atomicWrite(join(runtimeDir, RESUME_NOTICE_FILE), JSON.stringify(notice, null, 2) + "\n");
 			aggregatedWarnings.push(
-				`Resumed in ${worktree.worktreePath}, not the session's original directory ${
-					params.resume.sessionCwd ?? "(unknown)"
-				}; a directory-change notice is injected into the child session.`,
+				dirChanged
+					? `Resumed in ${worktree.worktreePath}, not the session's original directory ${
+							params.resume.sessionCwd ?? "(unknown)"
+						}; a directory-change notice is injected into the child session.`
+					: `Resumed on a fresh branch ${worktree.branch} with a reset working tree; a notice is injected into the child session.`,
 			);
 		}
 
@@ -2691,7 +2699,16 @@ function isChildRuntime(): boolean {
 	return Boolean(process.env[ENV_AGENT_ID]);
 }
 
-function buildResumeDirectoryNotice(options: {
+type ResumeNoticeFile = {
+	/** Unique per resume launch; the child dedups against notices already in the session. */
+	noticeId: string;
+	/** The worktree the notice is meant for; the child only injects when its cwd matches. */
+	targetCwd: string;
+	content: string;
+};
+
+function buildResumeNotice(options: {
+	dirChanged: boolean;
 	originalCwd?: string;
 	newCwd: string;
 	branch: string;
@@ -2699,46 +2716,58 @@ function buildResumeDirectoryNotice(options: {
 }): string {
 	const original = options.originalCwd ?? "(unknown)";
 	const branchLine = options.branchReattached
-		? `Branch \`${options.branch}\` was reattached here with its committed history; any uncommitted changes left in the original directory are NOT present.`
-		: `This session now runs on a fresh branch \`${options.branch}\` created from the main worktree's HEAD; earlier uncommitted or unmerged work from this conversation is NOT present here.`;
+		? `Branch \`${options.branch}\` was reattached here with its committed history; uncommitted changes that were left in the original directory are NOT present.`
+		: `This session now runs on a fresh branch \`${options.branch}\` created from the main worktree's HEAD, in a reset working tree; earlier uncommitted or unmerged work from this conversation is NOT present here.`;
+	if (!options.dirChanged) {
+		return [
+			"⚠️ WORKING TREE RESET — this session was resumed, but not on its previous branch state.",
+			"",
+			branchLine,
+			"",
+			"Re-inspect the working tree (`git status`, `git log`) before continuing; do not assume files are in the state you remember.",
+		].join("\n");
+	}
 	return [
 		"⚠️ WORKING DIRECTORY CHANGED — this session was resumed in a DIFFERENT directory.",
 		"",
-		`- Original directory (everything earlier in this conversation): ${original}`,
-		`- Current directory (use this from now on):                        ${options.newCwd}`,
+		`- Previous directory (used before this notice): ${original}`,
+		`- Current directory (use this from now on):     ${options.newCwd}`,
 		"",
 		branchLine,
 		"",
-		`Every path mentioned earlier that pointed under ${original} now lives under ${options.newCwd}. ` +
-			"Run all commands, reads and edits against the current directory; do NOT read from or modify the original directory (it may be in use by another agent or no longer exist). " +
-			"Re-inspect the working tree (`git status`, `git log`) before continuing, since it may differ from what you remember.",
+		`Resolve any path from earlier in this conversation that pointed under ${original} against ${options.newCwd} instead; such files may be missing or differ here. ` +
+			"Run all commands, reads and edits against the current directory; do NOT read from or modify the previous directory (it may be in use by another agent or no longer exist). " +
+			"Re-inspect the working tree (`git status`, `git log`) before continuing.",
 	].join("\n");
 }
 
-/** Child side: append the parent's directory-change notice (if any) as a
- * visible custom message past the last turn, then consume the file so it is
- * injected exactly once. */
+/** Child side, on process startup: append the parent's resume notice (if any)
+ * as a visible custom message past the last turn. Idempotent: scoped to the
+ * target worktree and deduplicated by noticeId against the session entries, so
+ * neither /new, /resume, /reload in the child nor a re-run of launch.sh (which
+ * re-forks the original session and legitimately needs the notice again) can
+ * inject it twice into one session or into an unrelated one. */
 async function injectResumeNoticeIfPresent(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	const runtimeDir = process.env[ENV_RUNTIME_DIR];
 	if (!isChildRuntime() || !runtimeDir) return;
-	const noticePath = join(runtimeDir, RESUME_NOTICE_FILE);
-	let notice: string;
-	try {
-		notice = await fs.readFile(noticePath, "utf8");
-	} catch {
-		return;
+	const notice = await readJsonFile<Partial<ResumeNoticeFile>>(join(runtimeDir, RESUME_NOTICE_FILE));
+	if (!notice || typeof notice.noticeId !== "string" || typeof notice.targetCwd !== "string") return;
+	if (typeof notice.content !== "string" || !notice.content.trim()) return;
+	if (resolve(notice.targetCwd) !== resolve(ctx.cwd)) return;
+	for (const entry of ctx.sessionManager.getEntries()) {
+		if (entry.type !== "custom_message") continue;
+		const existing = entry as { customType?: string; details?: { noticeId?: unknown } };
+		if (existing.customType === RESUME_NOTICE_MESSAGE_TYPE && existing.details?.noticeId === notice.noticeId) return;
 	}
-	if (!notice.trim()) return;
 	pi.sendMessage(
 		{
 			customType: RESUME_NOTICE_MESSAGE_TYPE,
-			content: notice.trimEnd(),
+			content: notice.content.trimEnd(),
 			display: true,
-			details: { cwd: ctx.cwd, injectedAt: Date.now() },
+			details: { noticeId: notice.noticeId, cwd: ctx.cwd, injectedAt: Date.now() },
 		},
 		{ triggerTurn: false },
 	);
-	await fs.rm(noticePath, { force: true });
 }
 
 function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): StatusTransitionNotice[] {
@@ -3486,9 +3515,13 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		await injectResumeNoticeIfPresent(pi, ctx).catch(() => {});
+		if (event.reason === "startup") {
+			await injectResumeNoticeIfPresent(pi, ctx).catch((err) => {
+				if (ctx.hasUI) ctx.ui.notify(`side-agent: failed to inject resume notice: ${stringifyError(err)}`, "warning");
+			});
+		}
 		ensureStatusPoller(pi, ctx);
 	});
 
