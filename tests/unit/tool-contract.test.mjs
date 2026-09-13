@@ -16,7 +16,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
@@ -1259,4 +1259,40 @@ test("sanitizeRenameTitle — degenerate results are no-ops", () => {
 	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "fix-auth · Old"), undefined); // unchanged real name
 	assert.strictEqual(sanitizeRenameTitlePort(UNNAMED_HELD, "fix the auth leak"), undefined); // preview as-is
 	assert.strictEqual(sanitizeRenameTitlePort(NAMED, "   "), undefined); // empty
+});
+
+// ---------------------------------------------------------------------------
+// 8. /agent-resume slot preference (contract copy of allocateWorktree reorder)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ported from extensions/side-agents.ts allocateWorktree: the free-slot scan
+ * takes the first eligible slot, so the resumed session's original directory
+ * is moved to the front of the slot list when present.
+ * @param {{index:number,path:string}[]} slots
+ * @param {string|undefined} preferredPath
+ */
+function preferSlotPort(slots, preferredPath) {
+	if (preferredPath) {
+		const resolvedPreferred = resolvePath(preferredPath);
+		const idx = slots.findIndex((s) => resolvePath(s.path) === resolvedPreferred);
+		if (idx > 0) slots.unshift(...slots.splice(idx, 1));
+	}
+	return slots;
+}
+
+test("agent-resume slot preference — original session dir is scanned first", () => {
+	const mk = () => [
+		{ index: 1, path: "/w/repo-agent-worktree-0001" },
+		{ index: 2, path: "/w/repo-agent-worktree-0002" },
+		{ index: 3, path: "/w/repo-agent-worktree-0003" },
+	];
+	assert.deepStrictEqual(
+		preferSlotPort(mk(), "/w/repo-agent-worktree-0002/").map((s) => s.index),
+		[2, 1, 3],
+	);
+	// preferred already first / absent / undefined → order untouched
+	assert.deepStrictEqual(preferSlotPort(mk(), "/w/repo-agent-worktree-0001").map((s) => s.index), [1, 2, 3]);
+	assert.deepStrictEqual(preferSlotPort(mk(), "/w/repo").map((s) => s.index), [1, 2, 3]);
+	assert.deepStrictEqual(preferSlotPort(mk(), undefined).map((s) => s.index), [1, 2, 3]);
 });

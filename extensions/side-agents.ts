@@ -19,6 +19,10 @@ const REGISTRY_VERSION = 1;
 const CHILD_LINK_ENTRY_TYPE = "side-agent-link";
 const STATUS_UPDATE_MESSAGE_TYPE = "side-agent-status";
 const PROMPT_UPDATE_MESSAGE_TYPE = "side-agent-prompt";
+const RESUME_NOTICE_MESSAGE_TYPE = "side-agent-resume-notice";
+/** Runtime-dir file the parent writes when a resumed session is re-homed into
+ * a different directory; the child consumes it once on session_start. */
+const RESUME_NOTICE_FILE = "resume-notice.md";
 
 const SUMMARY_SYSTEM_PROMPT = `You are writing a minimal handoff summary for a background coding agent.
 
@@ -87,6 +91,8 @@ type AllocateWorktreeResult = {
 	slotIndex: number;
 	branch: string;
 	warnings: string[];
+	/** Resume mode: the requested existing branch was found and checked out (vs recreated from HEAD). */
+	branchReattached: boolean;
 };
 
 type StartAgentParams = {
@@ -1029,8 +1035,11 @@ async function allocateWorktree(options: {
 	parentSessionId?: string;
 	/** Resume mode: check out this pre-existing branch instead of creating side-agent/<id> from HEAD. */
 	existingBranch?: string;
+	/** Resume mode: the session's original cwd; when it is a free slot, prefer it
+	 * over other free slots so the resumed conversation's paths stay valid. */
+	preferredPath?: string;
 }): Promise<AllocateWorktreeResult> {
-	const { repoRoot, stateRoot, agentId, parentSessionId, existingBranch } = options;
+	const { repoRoot, stateRoot, agentId, parentSessionId, existingBranch, preferredPath } = options;
 
 	const warnings: string[] = [];
 	const branch = existingBranch ?? `side-agent/${agentId}`;
@@ -1039,6 +1048,13 @@ async function allocateWorktree(options: {
 	const registry = await loadRegistry(stateRoot);
 	const slots = await listWorktreeSlots(repoRoot);
 	const registered = listRegisteredWorktrees(repoRoot);
+	if (preferredPath) {
+		// The free-slot scan below takes the first eligible slot; move the
+		// session's original directory to the front so it wins when it is free.
+		const resolvedPreferred = resolve(preferredPath);
+		const idx = slots.findIndex((s) => resolve(s.path) === resolvedPreferred);
+		if (idx > 0) slots.unshift(...slots.splice(idx, 1));
+	}
 
 	let chosen: WorktreeSlot | undefined;
 	let maxIndex = 0;
@@ -1193,6 +1209,7 @@ async function allocateWorktree(options: {
 		slotIndex: chosen.index,
 		branch,
 		warnings,
+		branchReattached: Boolean(existingBranch) && resumeBranchExists,
 	};
 }
 
@@ -2238,6 +2255,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			agentId,
 			parentSessionId,
 			existingBranch: resumeBranch,
+			preferredPath: params.resume?.sessionCwd,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;
@@ -2316,6 +2334,29 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		const modelSpec = resolvedModel.modelSpec;
 		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
+		const resumeSessionMode: "session" | "fork" | undefined = params.resume
+			? params.resume.sessionCwd && resolve(params.resume.sessionCwd) === resolve(worktree.worktreePath)
+				? "session"
+				: "fork"
+			: undefined;
+		if (params.resume && resumeSessionMode === "fork") {
+			// The conversation history refers to paths under the original cwd; the
+			// child consumes this file on session_start and appends a prominent
+			// notice so the model stops targeting the old directory.
+			const notice = buildResumeDirectoryNotice({
+				originalCwd: params.resume.sessionCwd,
+				newCwd: worktree.worktreePath,
+				branch: worktree.branch,
+				branchReattached: worktree.branchReattached,
+			});
+			await atomicWrite(join(runtimeDir, RESUME_NOTICE_FILE), notice);
+			aggregatedWarnings.push(
+				`Resumed in ${worktree.worktreePath}, not the session's original directory ${
+					params.resume.sessionCwd ?? "(unknown)"
+				}; a directory-change notice is injected into the child session.`,
+			);
+		}
+
 		const tmuxSession = getCurrentTmuxSession();
 		const { windowId, windowIndex } = createTmuxWindow(tmuxSession, `agent-${agentId}`);
 		spawnedWindowId = windowId;
@@ -2337,12 +2378,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			modelSpec,
 			runtimeDir,
 			sessionPath: params.resume?.sessionPath,
-			sessionMode:
-				params.resume &&
-				params.resume.sessionCwd &&
-				resolve(params.resume.sessionCwd) === resolve(worktree.worktreePath)
-					? "session"
-					: "fork",
+			sessionMode: resumeSessionMode,
 		});
 		await atomicWrite(launchScriptPath, launchScript);
 		await fs.chmod(launchScriptPath, 0o755);
@@ -2653,6 +2689,56 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 
 function isChildRuntime(): boolean {
 	return Boolean(process.env[ENV_AGENT_ID]);
+}
+
+function buildResumeDirectoryNotice(options: {
+	originalCwd?: string;
+	newCwd: string;
+	branch: string;
+	branchReattached: boolean;
+}): string {
+	const original = options.originalCwd ?? "(unknown)";
+	const branchLine = options.branchReattached
+		? `Branch \`${options.branch}\` was reattached here with its committed history; any uncommitted changes left in the original directory are NOT present.`
+		: `This session now runs on a fresh branch \`${options.branch}\` created from the main worktree's HEAD; earlier uncommitted or unmerged work from this conversation is NOT present here.`;
+	return [
+		"⚠️ WORKING DIRECTORY CHANGED — this session was resumed in a DIFFERENT directory.",
+		"",
+		`- Original directory (everything earlier in this conversation): ${original}`,
+		`- Current directory (use this from now on):                        ${options.newCwd}`,
+		"",
+		branchLine,
+		"",
+		`Every path mentioned earlier that pointed under ${original} now lives under ${options.newCwd}. ` +
+			"Run all commands, reads and edits against the current directory; do NOT read from or modify the original directory (it may be in use by another agent or no longer exist). " +
+			"Re-inspect the working tree (`git status`, `git log`) before continuing, since it may differ from what you remember.",
+	].join("\n");
+}
+
+/** Child side: append the parent's directory-change notice (if any) as a
+ * visible custom message past the last turn, then consume the file so it is
+ * injected exactly once. */
+async function injectResumeNoticeIfPresent(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const runtimeDir = process.env[ENV_RUNTIME_DIR];
+	if (!isChildRuntime() || !runtimeDir) return;
+	const noticePath = join(runtimeDir, RESUME_NOTICE_FILE);
+	let notice: string;
+	try {
+		notice = await fs.readFile(noticePath, "utf8");
+	} catch {
+		return;
+	}
+	if (!notice.trim()) return;
+	pi.sendMessage(
+		{
+			customType: RESUME_NOTICE_MESSAGE_TYPE,
+			content: notice.trimEnd(),
+			display: true,
+			details: { cwd: ctx.cwd, injectedAt: Date.now() },
+		},
+		{ triggerTurn: false },
+	);
+	await fs.rm(noticePath, { force: true });
 }
 
 function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): StatusTransitionNotice[] {
@@ -3402,6 +3488,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
+		await injectResumeNoticeIfPresent(pi, ctx).catch(() => {});
 		ensureStatusPoller(pi, ctx);
 	});
 

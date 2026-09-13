@@ -57,7 +57,7 @@ This registers the extension and skill with Pi. Restart Pi after installing.
    - Old worktrees are kept around and reused and updated by new agents.
    - Old branches are auto-pruned during reuse by a new agent.
    - You can pause your work on a topic—if you `/quit` before work is merged, the branch will stay around.
-   - Pick up a paused topic later with `/agent-resume`: it lists past child sessions from this project's worktrees, then reopens the chosen session with its branch (in place if the worktree is untouched, otherwise in a fresh slot; a pruned no-commits branch is recreated from HEAD).
+   - Pick up a paused topic later with `/agent-resume`: it lists past child sessions from this project's worktrees, then reopens the chosen session with its branch (in place if the worktree is untouched, else preferring the session's original slot, else any free slot; a pruned no-commits branch is recreated from HEAD). When the session ends up in a different directory than it originally ran in, a prominent directory-change notice is appended to the child's conversation so it stops targeting the old paths.
 
 <p align="center">
 <img width="706" height="364" alt="image" src="https://github.com/user-attachments/assets/212a0fc3-7f84-4889-9eaa-80007280df01" />
