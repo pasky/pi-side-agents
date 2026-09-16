@@ -55,7 +55,7 @@ Write this file and make it executable (`chmod +x`).
 
 Use `MAIN_BRANCH` set to whatever the user specified in question 1 (or `main` by default). The start script validates the branch but does **not** reset HEAD — the TypeScript extension already sets the worktree to the parent's HEAD. Do **not** force-update the local `MAIN_BRANCH` ref (e.g. `git branch -f`) because that branch is often checked out in the parent worktree.
 
-**Default content** — substitute `MAIN_BRANCH_VALUE` with the actual branch name, then append bootstrap steps based on question 2:
+**Default content** — substitute `MAIN_BRANCH_VALUE` with the actual branch name, then append bootstrap steps based on question 2. Keep the `${PI_SIDE_PARENT_BRANCH:-...}` fallback verbatim: for a **nested** side agent (one spawned by another side agent) the extension sets `PI_SIDE_PARENT_BRANCH` to the spawning agent's branch, which is that agent's integration target instead of the main branch.
 
 ```bash
 #!/usr/bin/env bash
@@ -64,7 +64,8 @@ set -euo pipefail
 PARENT_ROOT="${1:-}"
 WORKTREE="${2:-$(pwd)}"
 AGENT_ID="${3:-unknown}"
-MAIN_BRANCH="MAIN_BRANCH_VALUE"
+# Nested side agents integrate into their parent agent's branch, not main.
+MAIN_BRANCH="${PI_SIDE_PARENT_BRANCH:-MAIN_BRANCH_VALUE}"
 
 BRANCH="$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 if [[ "$BRANCH" == "HEAD" ]]; then
@@ -119,7 +120,9 @@ set -euo pipefail
 
 PARENT_ROOT="${PI_SIDE_PARENT_REPO:-${1:-}}"
 AGENT_ID="${PI_SIDE_AGENT_ID:-${2:-unknown}}"
-MAIN_BRANCH="MAIN_BRANCH_VALUE"
+# Nested side agents integrate into their parent agent's branch (checked out in
+# PARENT_ROOT, which is then the parent agent's worktree), not main.
+MAIN_BRANCH="${PI_SIDE_PARENT_BRANCH:-MAIN_BRANCH_VALUE}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 if [[ "$BRANCH" == "HEAD" ]]; then
   BRANCH=""
@@ -224,7 +227,8 @@ done
 set -euo pipefail
 
 AGENT_ID="${PI_SIDE_AGENT_ID:-${1:-unknown}}"
-MAIN_BRANCH="MAIN_BRANCH_VALUE"
+# Nested side agents open their PR against their parent agent's branch, not main.
+MAIN_BRANCH="${PI_SIDE_PARENT_BRANCH:-MAIN_BRANCH_VALUE}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 if [[ "$BRANCH" == "HEAD" ]]; then
   BRANCH=""
@@ -263,7 +267,7 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it", "merge 
 PI_SIDE_PARENT_REPO="$PI_SIDE_PARENT_REPO" .pi/side-agent-finish.sh
 ```
 
-3. If the finish script exits with code 2 (conflict rebasing child branch onto MAIN_BRANCH_VALUE):
+3. If the finish script exits with code 2 (conflict rebasing child branch onto MAIN_BRANCH_VALUE — or onto `$PI_SIDE_PARENT_BRANCH`, your parent agent's branch, if you are a nested side agent):
    - Stay in this worktree
    - Resolve conflicts (`git status`, then `git rebase --continue`)
    - Re-run the finish script after the rebase completes
@@ -311,3 +315,4 @@ Explicitly remind the user that `.pi/side-agent-*` files are local runtime setup
 - Start an agent: `/agent <task description>`
 - Watch status: statusline shows active agents, ...@<number> is the tmux window to switch to; `/agents` lists all
 - Ask you to set up and manage a flock of multiple side agents on your own to solve a task (you have the tools)
+- Side agents can spawn their own side agents (one extra level). A nested agent branches off its parent agent's branch, merges back into it via the same finish script (`PI_SIDE_PARENT_BRANCH`), and its status notices go to the parent agent, not to this session.

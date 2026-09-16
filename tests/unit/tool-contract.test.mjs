@@ -1296,3 +1296,115 @@ test("agent-resume slot preference — original session dir is scanned first", (
 	assert.deepStrictEqual(preferSlotPort(mk(), "/w/repo").map((s) => s.index), [1, 2, 3]);
 	assert.deepStrictEqual(preferSlotPort(mk(), undefined).map((s) => s.index), [1, 2, 3]);
 });
+
+// ---------------------------------------------------------------------------
+// 9. Nested side agents — ownership / visibility predicates (contract copies
+//    of getSelfIdentity / isOwnedBySelf / isOrphanRecord / isSiblingRecord)
+// ---------------------------------------------------------------------------
+
+const MAX_AGENT_DEPTH = 2;
+
+/** @param {{PI_SIDE_AGENT_ID?:string, PI_SIDE_PARENT_AGENT_ID?:string, PI_SIDE_AGENT_DEPTH?:string}} env */
+function getSelfIdentityPort(env) {
+	const selfId = env.PI_SIDE_AGENT_ID || undefined;
+	if (!selfId) return { depth: 0 };
+	const rawDepth = Number(env.PI_SIDE_AGENT_DEPTH);
+	const depth = Number.isInteger(rawDepth) && rawDepth > 0 ? rawDepth : 1;
+	return { selfId, parentAgentId: env.PI_SIDE_PARENT_AGENT_ID || undefined, depth };
+}
+
+function isOrphanRecordPort(record, self, liveIds) {
+	return !self.selfId && record.parentAgentId !== undefined && !liveIds.has(record.parentAgentId);
+}
+
+function isOwnedBySelfPort(record, self, liveIds) {
+	if (record.parentAgentId === self.selfId) return true;
+	return isOrphanRecordPort(record, self, liveIds);
+}
+
+function isSiblingRecordPort(record, self) {
+	if (record.id === self.selfId) return false;
+	return record.parentAgentId === self.parentAgentId;
+}
+
+/** Status-line scope: own children first, then siblings. */
+function statusLineScopePort(agents, self) {
+	const liveIds = new Set(agents.map((r) => r.id));
+	const children = [];
+	const siblings = [];
+	for (const record of agents) {
+		if (isOwnedBySelfPort(record, self, liveIds)) children.push(record.id);
+		else if (isSiblingRecordPort(record, self)) siblings.push(record.id);
+	}
+	return { children, siblings };
+}
+
+/** Notification scope: transitions routed to this session. */
+function routedTransitionsPort(agents, self) {
+	const liveIds = new Set(agents.map((r) => r.id));
+	return agents.filter((r) => isOwnedBySelfPort(r, self, liveIds)).map((r) => r.id);
+}
+
+// main
+//  ├─ a        (depth 1)
+//  │   ├─ a1   (depth 2)
+//  │   └─ a2   (depth 2)
+//  └─ b        (depth 1)
+//  z1          (depth 2, parent "z" has quit → orphan)
+const TREE = [
+	{ id: "a", parentAgentId: undefined, depth: 1 },
+	{ id: "a1", parentAgentId: "a", depth: 2 },
+	{ id: "a2", parentAgentId: "a", depth: 2 },
+	{ id: "b", parentAgentId: undefined, depth: 1 },
+	{ id: "z1", parentAgentId: "z", depth: 2 },
+];
+
+const MAIN = getSelfIdentityPort({});
+const A = getSelfIdentityPort({ PI_SIDE_AGENT_ID: "a", PI_SIDE_AGENT_DEPTH: "1" });
+const A1 = getSelfIdentityPort({ PI_SIDE_AGENT_ID: "a1", PI_SIDE_PARENT_AGENT_ID: "a", PI_SIDE_AGENT_DEPTH: "2" });
+
+test("nested: getSelfIdentity — main, child, grandchild, legacy child", () => {
+	assert.deepStrictEqual(MAIN, { depth: 0 });
+	assert.deepStrictEqual(A, { selfId: "a", parentAgentId: undefined, depth: 1 });
+	assert.deepStrictEqual(A1, { selfId: "a1", parentAgentId: "a", depth: 2 });
+	// Child launched by an older version: no depth/parent env → direct child of main.
+	assert.deepStrictEqual(getSelfIdentityPort({ PI_SIDE_AGENT_ID: "old" }), {
+		selfId: "old",
+		parentAgentId: undefined,
+		depth: 1,
+	});
+	assert.deepStrictEqual(getSelfIdentityPort({ PI_SIDE_AGENT_ID: "x", PI_SIDE_AGENT_DEPTH: "junk" }).depth, 1);
+});
+
+test("nested: notifications go to the direct parent only; orphans fall back to main", () => {
+	// KEY requirement: main never hears about a1/a2 while `a` is alive.
+	assert.deepStrictEqual(routedTransitionsPort(TREE, MAIN), ["a", "b", "z1"]);
+	assert.deepStrictEqual(routedTransitionsPort(TREE, A), ["a1", "a2"]);
+	assert.deepStrictEqual(routedTransitionsPort(TREE, A1), []);
+	// Once `a` quits (record pruned), a1/a2 become orphans and main adopts them.
+	const withoutA = TREE.filter((r) => r.id !== "a");
+	assert.deepStrictEqual(routedTransitionsPort(withoutA, MAIN), ["a1", "a2", "b", "z1"]);
+	const live = new Set(withoutA.map((r) => r.id));
+	assert.strictEqual(isOrphanRecordPort(withoutA[0], MAIN, live), true);
+	// A child session never treats anything as an orphan (only main adopts).
+	assert.strictEqual(isOrphanRecordPort(withoutA[0], A1, live), false);
+});
+
+test("nested: status line shows own children + siblings", () => {
+	// main: direct children (+ orphans); "siblings" collapse into the same set.
+	assert.deepStrictEqual(statusLineScopePort(TREE, MAIN), { children: ["a", "b", "z1"], siblings: [] });
+	// depth-1 agent: its children, then its siblings (self excluded).
+	assert.deepStrictEqual(statusLineScopePort(TREE, A), { children: ["a1", "a2"], siblings: ["b"] });
+	// leaf grandchild: siblings only.
+	assert.deepStrictEqual(statusLineScopePort(TREE, A1), { children: [], siblings: ["a2"] });
+	// an orphan is not a sibling of main's children in a child's view
+	const B = getSelfIdentityPort({ PI_SIDE_AGENT_ID: "b", PI_SIDE_AGENT_DEPTH: "1" });
+	assert.deepStrictEqual(statusLineScopePort(TREE, B), { children: [], siblings: ["a"] });
+});
+
+test("nested: depth cap — grandchildren cannot spawn", () => {
+	const canSpawn = (self) => self.depth + 1 <= MAX_AGENT_DEPTH;
+	assert.strictEqual(canSpawn(MAIN), true);
+	assert.strictEqual(canSpawn(A), true);
+	assert.strictEqual(canSpawn(A1), false);
+});

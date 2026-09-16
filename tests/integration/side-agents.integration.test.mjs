@@ -1599,3 +1599,191 @@ test(
 		await closeChildWindowAfterPrompt(harness, agentId);
 	},
 );
+
+// ---------------------------------------------------------------------------
+// Nested side agents: main → outer → inner
+// ---------------------------------------------------------------------------
+
+async function readSessionEntriesFromFile(sessionPath) {
+	const raw = await readFile(sessionPath, "utf8").catch(() => "");
+	return raw
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			try {
+				return JSON.parse(line);
+			} catch {
+				return null;
+			}
+		})
+		.filter(Boolean);
+}
+
+function extractStatusNotices(entries, agentId) {
+	return entries
+		.filter((e) => e.type === "custom_message" && e.customType === "side-agent-status")
+		.filter((e) => e.details?.agentId === agentId);
+}
+
+async function waitForChildSessionPath(harness, agentId, timeoutMs = 120_000) {
+	return waitFor(
+		`childSessionId for ${agentId}`,
+		async () => {
+			const registry = await readRegistry(harness);
+			const path = registry.agents?.[agentId]?.childSessionId;
+			return typeof path === "string" && path.length > 0 && (await exists(path)) ? path : false;
+		},
+		{ timeoutMs, intervalMs: 400 },
+	);
+}
+
+/** Drive a child pi directly through its tmux pane (no LLM hop through the parent). */
+async function sendChildCommand(harness, windowId, command) {
+	await sendLineToPane(harness, windowId, command);
+}
+
+async function callToolInChildSession(harness, windowId, sessionPath, toolName, params, options = {}) {
+	const timeoutMs = options.timeoutMs ?? 120_000;
+	const retries = options.retries ?? 3;
+	const argsJson = JSON.stringify(params);
+	let lastError;
+	for (let attempt = 1; attempt <= retries; attempt += 1) {
+		const beforeCount = extractToolResultPayloads(await readSessionEntriesFromFile(sessionPath), toolName).length;
+		const prompt =
+			attempt === 1
+				? `Use the ${toolName} tool now with this exact JSON arguments object: ${argsJson}. Do not call any other tool.`
+				: `Important: call the ${toolName} tool immediately (not text-only). Use exactly this JSON arguments object: ${argsJson}.`;
+		await sendChildCommand(harness, windowId, prompt);
+		try {
+			return await waitFor(
+				`tool result for "${toolName}" in ${sessionPath}`,
+				async () => {
+					const results = extractToolResultPayloads(await readSessionEntriesFromFile(sessionPath), toolName);
+					return results.length > beforeCount ? results[results.length - 1] : false;
+				},
+				{ timeoutMs, intervalMs: 500 },
+			);
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError ?? new Error(`Timed out waiting for ${toolName} tool result in child`);
+}
+
+test(
+	"integration: nested side agent branches off its parent agent and notifies only that parent",
+	{ timeout: Math.max(TEST_TIMEOUT, 600_000) },
+	async (t) => {
+		if (!assertAuthOrSkip(t)) return;
+
+		const harness = await createHarness(t);
+
+		// 1. main → outer
+		const outerStart = await callToolViaPrompt(
+			harness,
+			"agent-start",
+			{ description: "nested scenario outer: wait for instructions", branchHint: "outer", model: MODEL_SPEC },
+			{ timeoutMs: 120_000, retries: 3 },
+		);
+		assert.equal(outerStart.payload.ok, true, `outer agent-start should succeed: ${JSON.stringify(outerStart.payload)}`);
+		assert.equal(outerStart.payload.id, "outer");
+		assert.equal(outerStart.payload.depth, 1);
+		assert.equal(outerStart.payload.parentAgentId, undefined);
+		const outer = await waitForSpawnedAgent(harness, "outer", 180_000);
+		await waitForChildPiBooted(harness, "outer", 120_000);
+		const outerSessionPath = await waitForChildSessionPath(harness, "outer");
+
+		// Put a commit on outer's branch so we can prove inner is based on it, not on main.
+		await writeFile(join(outer.worktreePath, "outer.txt"), "outer work\n");
+		run("git", ["add", "outer.txt"], { cwd: outer.worktreePath });
+		run("git", ["-c", "user.email=it@example.com", "-c", "user.name=IT", "commit", "-m", "outer work"], {
+			cwd: outer.worktreePath,
+		});
+		const outerHead = run("git", ["rev-parse", "HEAD"], { cwd: outer.worktreePath }).stdout.trim();
+		const mainHead = run("git", ["rev-parse", "HEAD"], { cwd: harness.repoRoot }).stdout.trim();
+		assert.notEqual(outerHead, mainHead);
+
+		// 2. outer → inner (tool call driven directly in outer's pane)
+		const innerStart = await callToolInChildSession(harness, outer.tmuxWindowId, outerSessionPath, "agent-start", {
+			description: "nested scenario inner: reply with one word and wait",
+			branchHint: "inner",
+			model: MODEL_SPEC,
+		});
+		assert.equal(innerStart.payload.ok, true, `inner agent-start should succeed: ${JSON.stringify(innerStart.payload)}`);
+		assert.equal(innerStart.payload.id, "inner");
+		assert.equal(innerStart.payload.parentAgentId, "outer");
+		assert.equal(innerStart.payload.depth, 2);
+
+		const inner = await waitForSpawnedAgent(harness, "inner", 180_000);
+		assert.equal(inner.parentAgentId, "outer");
+		assert.equal(inner.depth, 2);
+		assert.equal(inner.tmuxSession, outer.tmuxSession, "inner must live in the same tmux session");
+		assert.ok(windowExists(harness, inner.tmuxWindowId), "inner window should exist in the shared tmux session");
+
+		// Branch base + finish target: inner forks from outer's HEAD, merges into outer's branch.
+		const innerBase = run("git", ["rev-parse", "side-agent/inner"], { cwd: harness.repoRoot }).stdout.trim();
+		assert.equal(innerBase, outerHead, "inner branch must start at outer's HEAD, not main's");
+		const launch = await readFile(join(inner.runtimeDir, "launch.sh"), "utf8");
+		assert.match(launch, new RegExp(`PARENT_REPO='${outer.worktreePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+		assert.match(launch, /PARENT_BRANCH='side-agent\/outer'/);
+		assert.match(launch, /PARENT_AGENT_ID='outer'/);
+		assert.match(launch, /AGENT_DEPTH='2'/);
+		const kickoff = await readFile(inner.promptPath, "utf8");
+		assert.match(kickoff, /## Nested side agent/);
+		assert.match(kickoff, /side-agent\/outer/);
+
+		// 3. Notification scoping: inner's lifecycle reaches outer's session, never main's.
+		await waitForChildPiBooted(harness, "inner", 120_000);
+		const innerSessionPath = await waitForChildSessionPath(harness, "inner");
+		await waitForAgent(harness, "inner", { status: "waiting_user", timeoutMs: 180_000 });
+		await waitFor(
+			"outer session to receive a side-agent-status notice for inner",
+			async () => extractStatusNotices(await readSessionEntriesFromFile(outerSessionPath), "inner").length > 0,
+			{ timeoutMs: 90_000, intervalMs: 1_000 },
+		);
+
+		// 4. Depth cap: inner may not spawn.
+		const tooDeep = await callToolInChildSession(harness, inner.tmuxWindowId, innerSessionPath, "agent-start", {
+			description: "should be refused",
+			branchHint: "too-deep",
+			model: MODEL_SPEC,
+		});
+		assert.equal(tooDeep.payload.ok, false, `depth-3 agent-start must fail: ${JSON.stringify(tooDeep.payload)}`);
+		assert.match(String(tooDeep.payload.error), /Nesting limit/);
+		assert.equal((await readRegistry(harness)).agents["too-deep"], undefined);
+
+		// 5. inner quits → outer gets the terminal notice; main still hears nothing about inner.
+		await sendChildCommand(harness, inner.tmuxWindowId, "/quit");
+		await waitForAgentRemoved(harness, "inner", 120_000);
+		await closeChildWindowAfterPrompt(harness, "inner", inner.tmuxWindowId).catch(() => {});
+		await waitFor(
+			"outer session to receive inner's terminal notice",
+			async () =>
+				extractStatusNotices(await readSessionEntriesFromFile(outerSessionPath), "inner").some(
+					(e) => e.details?.toStatus === "done",
+				),
+			{ timeoutMs: 90_000, intervalMs: 1_000 },
+		);
+		const mainEntries = await readParentSessionEntries(harness);
+		assert.equal(
+			extractStatusNotices(mainEntries, "inner").length,
+			0,
+			"main session must not receive notices for a grandchild",
+		);
+		assert.ok(
+			extractStatusNotices(mainEntries, "outer").length > 0 ||
+				(await waitFor(
+					"main session to receive some notice for outer",
+					async () => extractStatusNotices(await readParentSessionEntries(harness), "outer").length > 0,
+					{ timeoutMs: 60_000, intervalMs: 1_000 },
+				)),
+			"main session should still get notices for its direct child",
+		);
+
+		// Cleanup outer.
+		await sendChildCommand(harness, outer.tmuxWindowId, "/quit");
+		await waitForAgent(harness, "outer", { terminal: true, timeoutMs: 180_000 });
+		await closeChildWindowAfterPrompt(harness, "outer", outer.tmuxWindowId);
+	},
+);

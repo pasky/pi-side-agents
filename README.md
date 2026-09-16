@@ -23,6 +23,7 @@ The most advanced users of AI coding agents have worked like this for a while, b
 - New command `/agent-resume` to pick a previously `/quit` side-agent session and reopen it (conversation + branch) in a worktree/tmux window.
 - New skill `agent-setup` to scaffold project-specific lifecycle scripts (flexible worktree initialization and merge process).
 - Exposes orchestration _tools_ for parent agents: `agent-start`, `agent-check`, `agent-wait-any`, `agent-send`
+- Side agents can delegate further: a side agent may spawn its own side agents (one extra level). They branch off the parent agent's branch, merge back into it, and report to the parent agent only — the main session's notices and statusline stay limited to its direct children.
 
 ## Install
 

@@ -13,6 +13,14 @@ const ENV_AGENT_ID = "PI_SIDE_AGENT_ID";
 const ENV_PARENT_SESSION = "PI_SIDE_PARENT_SESSION";
 const ENV_PARENT_REPO = "PI_SIDE_PARENT_REPO";
 const ENV_RUNTIME_DIR = "PI_SIDE_RUNTIME_DIR";
+/** Branch checked out in the parent checkout (the merge target of the finish script). */
+const ENV_PARENT_BRANCH = "PI_SIDE_PARENT_BRANCH";
+/** Agent id of the session that spawned this one; unset when spawned by the main session. */
+const ENV_PARENT_AGENT_ID = "PI_SIDE_PARENT_AGENT_ID";
+/** Nesting depth: main session = 0, its children = 1, grandchildren = 2. */
+const ENV_DEPTH = "PI_SIDE_AGENT_DEPTH";
+/** Deepest agent that may exist; agents at this depth cannot spawn further. */
+const MAX_AGENT_DEPTH = 2;
 
 const STATUS_KEY = "side-agents";
 const REGISTRY_VERSION = 1;
@@ -61,6 +69,10 @@ const DEFAULT_WAIT_STATES: AgentStatus[] = ["waiting_user", "failed", "crashed"]
 type AgentRecord = {
 	id: string;
 	parentSessionId?: string;
+	/** Agent id of the spawning session; undefined when spawned by the main session. */
+	parentAgentId?: string;
+	/** Nesting depth (1 = spawned by main). Missing on records from older versions ⇒ 1. */
+	depth?: number;
 	childSessionId?: string;
 	tmuxSession?: string;
 	tmuxWindowId?: string;
@@ -121,6 +133,8 @@ type StartAgentParams = {
 
 type StartAgentResult = {
 	id: string;
+	parentAgentId?: string;
+	depth: number;
 	tmuxWindowId: string;
 	tmuxWindowIndex: number;
 	worktreePath: string;
@@ -153,6 +167,9 @@ type StatusTransitionNotice = {
 	fromStatus: AgentStatus;
 	toStatus: AgentStatus;
 	tmuxWindowIndex?: number;
+	parentAgentId?: string;
+	/** The agent's parent was pruned from the registry (it quit while this one still ran). */
+	orphaned?: boolean;
 };
 
 /**
@@ -171,7 +188,51 @@ type PendingStatusTransition = StatusTransitionNotice & {
 type AgentStatusSnapshot = {
 	status: AgentStatus;
 	tmuxWindowIndex?: number;
+	parentAgentId?: string;
 };
+
+/** Identity of the running session within the agent tree. */
+type SelfIdentity = {
+	/** Own agent id; undefined for the main session. */
+	selfId?: string;
+	/** Own parent's agent id; undefined for the main session and its direct children. */
+	parentAgentId?: string;
+	depth: number;
+};
+
+function getSelfIdentity(): SelfIdentity {
+	const selfId = process.env[ENV_AGENT_ID] || undefined;
+	if (!selfId) return { depth: 0 };
+	const rawDepth = Number(process.env[ENV_DEPTH]);
+	// Children launched by older versions carry no depth; they are direct children of main.
+	const depth = Number.isInteger(rawDepth) && rawDepth > 0 ? rawDepth : 1;
+	return { selfId, parentAgentId: process.env[ENV_PARENT_AGENT_ID] || undefined, depth };
+}
+
+/**
+ * Whether `record` is owned by the current session, i.e. the current session
+ * spawned it (main owns records without a parentAgentId). Orphans — records
+ * whose parent has been pruned from the registry — fall back to main, which
+ * is the only session left that can act on them.
+ */
+function isOwnedBySelf(record: { parentAgentId?: string }, self: SelfIdentity, liveIds: ReadonlySet<string>): boolean {
+	if (record.parentAgentId === self.selfId) return true;
+	return isOrphanRecord(record, self, liveIds);
+}
+
+function isOrphanRecord(record: { parentAgentId?: string }, self: SelfIdentity, liveIds: ReadonlySet<string>): boolean {
+	return !self.selfId && record.parentAgentId !== undefined && !liveIds.has(record.parentAgentId);
+}
+
+/**
+ * Whether `record` belongs in the status line of the current session: its own
+ * children plus its siblings (same parent). For the main session both sets
+ * coincide with "direct children"; orphans are shown to main as well.
+ */
+function isSiblingRecord(record: { id: string; parentAgentId?: string }, self: SelfIdentity): boolean {
+	if (record.id === self.selfId) return false;
+	return record.parentAgentId === self.parentAgentId;
+}
 
 let statusPollTimer: NodeJS.Timeout | undefined;
 let statusPollContext: ExtensionContext | undefined;
@@ -1042,12 +1103,15 @@ async function allocateWorktree(options: {
 	/** Resume mode: the session's original cwd; when it is a free slot, prefer it
 	 * over other free slots so the resumed conversation's paths stay valid. */
 	preferredPath?: string;
+	/** Commit to base a fresh branch on; defaults to the main repo's HEAD. A nested
+	 * agent passes its own HEAD so the grandchild's work builds on the child's branch. */
+	baseHead?: string;
 }): Promise<AllocateWorktreeResult> {
 	const { repoRoot, stateRoot, agentId, parentSessionId, existingBranch, preferredPath } = options;
 
 	const warnings: string[] = [];
 	const branch = existingBranch ?? `side-agent/${agentId}`;
-	const mainHead = runOrThrow("git", ["-C", repoRoot, "rev-parse", "HEAD"]).stdout.trim();
+	const mainHead = options.baseHead ?? runOrThrow("git", ["-C", repoRoot, "rev-parse", "HEAD"]).stdout.trim();
 
 	const registry = await loadRegistry(stateRoot);
 	const slots = await listWorktreeSlots(repoRoot);
@@ -1289,7 +1353,12 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 function buildLaunchScript(params: {
 	agentId: string;
 	parentSessionId?: string;
+	/** The spawning session's checkout (main repo, or the parent agent's worktree when nested). */
 	parentRepoRoot: string;
+	/** Branch checked out in parentRepoRoot: the merge target for the finish script. */
+	parentBranch: string;
+	parentAgentId?: string;
+	depth: number;
 	stateRoot: string;
 	worktreePath: string;
 	tmuxWindowId: string;
@@ -1308,6 +1377,9 @@ set -euo pipefail
 AGENT_ID=${shellQuote(params.agentId)}
 PARENT_SESSION=${shellQuote(params.parentSessionId ?? "")}
 PARENT_REPO=${shellQuote(params.parentRepoRoot)}
+PARENT_BRANCH=${shellQuote(params.parentBranch)}
+PARENT_AGENT_ID=${shellQuote(params.parentAgentId ?? "")}
+AGENT_DEPTH=${shellQuote(String(params.depth))}
 STATE_ROOT=${shellQuote(params.stateRoot)}
 WORKTREE=${shellQuote(params.worktreePath)}
 WINDOW_ID=${shellQuote(params.tmuxWindowId)}
@@ -1323,6 +1395,9 @@ CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
 export ${ENV_AGENT_ID}=\"$AGENT_ID\"
 export ${ENV_PARENT_SESSION}=\"$PARENT_SESSION\"
 export ${ENV_PARENT_REPO}=\"$PARENT_REPO\"
+export ${ENV_PARENT_BRANCH}=\"$PARENT_BRANCH\"
+export ${ENV_PARENT_AGENT_ID}=\"$PARENT_AGENT_ID\"
+export ${ENV_DEPTH}=\"$AGENT_DEPTH\"
 export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
 
@@ -2189,8 +2264,25 @@ function normalizeAgentId(raw: string): string {
 async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: StartAgentParams): Promise<StartAgentResult> {
 	ensureTmuxReady();
 
+	const self = getSelfIdentity();
+	const depth = self.depth + 1;
+	if (depth > MAX_AGENT_DEPTH) {
+		throw new Error(
+			`Nesting limit reached: this session is a side agent at depth ${self.depth} and agents deeper than ${MAX_AGENT_DEPTH} are not allowed. Do the work yourself or ask your parent to delegate.`,
+		);
+	}
+
 	const stateRoot = getStateRoot(ctx);
+	// Registry, worktree slots and `git worktree add` always go through the main
+	// repo so ids/slots stay globally unique across nesting levels...
 	const repoRoot = resolveGitRoot(stateRoot);
+	// ...but a nested agent bases the new branch on ITS checkout, and that is
+	// where the child's finish script will fast-forward into.
+	const parentCheckout = self.selfId ? resolveGitRoot(ctx.cwd) : repoRoot;
+	const parentBranch = getCurrentBranch(parentCheckout);
+	if (self.selfId && !parentBranch) {
+		throw new Error(`Cannot spawn a nested agent: ${parentCheckout} is not on a branch (detached HEAD)`);
+	}
 	const parentSessionId = ctx.sessionManager.getSessionFile();
 	const now = nowIso();
 
@@ -2233,6 +2325,8 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			registry.agents[agentId] = {
 				id: agentId,
 				parentSessionId,
+				parentAgentId: self.selfId,
+				depth,
 				task: params.task,
 				model: params.model,
 				status: "allocating_worktree",
@@ -2261,6 +2355,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			parentSessionId,
 			existingBranch: resumeBranch,
 			preferredPath: params.resume?.sessionCwd,
+			baseHead: self.selfId ? runOrThrow("git", ["-C", parentCheckout, "rev-parse", "HEAD"]).stdout.trim() : undefined,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
 		allocatedBranch = worktree.branch;
@@ -2302,6 +2397,9 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			const kickoff = await buildKickoffPrompt(ctx, params.task, params.includeSummary);
 			if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
 			kickoffPrompt = kickoff.prompt;
+			if (self.selfId) {
+				kickoffPrompt += buildNestedKickoffSuffix(self.selfId, parentBranch, parentCheckout, depth);
+			}
 		}
 
 		await atomicWrite(promptPath, kickoffPrompt ? kickoffPrompt + "\n" : "");
@@ -2386,7 +2484,10 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		const launchScript = buildLaunchScript({
 			agentId,
 			parentSessionId,
-			parentRepoRoot: repoRoot,
+			parentRepoRoot: parentCheckout,
+			parentBranch,
+			parentAgentId: self.selfId,
+			depth,
 			stateRoot,
 			worktreePath: worktree.worktreePath,
 			tmuxWindowId: windowId,
@@ -2435,6 +2536,8 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		const started: StartAgentResult = {
 			id: agentId,
+			parentAgentId: self.selfId,
+			depth,
 			tmuxWindowId: windowId,
 			tmuxWindowIndex: windowIndex,
 			worktreePath: worktree.worktreePath,
@@ -2472,6 +2575,17 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 	}
 }
 
+function buildNestedKickoffSuffix(parentAgentId: string, parentBranch: string, parentCheckout: string, depth: number): string {
+	return [
+		"",
+		"",
+		"## Nested side agent",
+		`You were spawned by side agent \`${parentAgentId}\` (you are at nesting depth ${depth}), not by the main session. ` +
+			`Your branch is based on its branch \`${parentBranch}\` (checked out at ${parentCheckout}), and that branch — not the project's main branch — is where your finished work is merged. ` +
+			"Report to that agent; it reviews your work and tells you when to merge.",
+	].join("\n");
+}
+
 async function agentCheckPayload(stateRoot: string, agentId: string): Promise<Record<string, unknown>> {
 	const normalizedId = normalizeAgentId(agentId);
 	if (!normalizedId) {
@@ -2496,6 +2610,8 @@ async function agentCheckPayload(stateRoot: string, agentId: string): Promise<Re
 		agent: {
 			id: record.id,
 			status: record.status,
+			parentAgentId: record.parentAgentId,
+			depth: record.depth ?? 1,
 			tmuxWindowId: record.tmuxWindowId,
 			tmuxWindowIndex: record.tmuxWindowIndex,
 			worktreePath: record.worktreePath,
@@ -2708,6 +2824,31 @@ function isChildRuntime(): boolean {
 	return Boolean(process.env[ENV_AGENT_ID]);
 }
 
+/**
+ * A nested agent's finish script must merge into the parent agent's branch,
+ * which the agent-setup skill template reads from PI_SIDE_PARENT_BRANCH. Older
+ * setups hardcode the main branch; warn (in the UI and to the model) so the
+ * grandchild does not fast-forward main behind its parent's back.
+ */
+async function warnIfFinishScriptIgnoresParentBranch(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const self = getSelfIdentity();
+	if (self.depth < 2) return;
+	const finishScript = join(ctx.cwd, ".pi", "side-agent-finish.sh");
+	let raw: string;
+	try {
+		raw = await fs.readFile(finishScript, "utf8");
+	} catch {
+		return; // no finish script (e.g. PR policy without one, or not set up) — nothing to warn about
+	}
+	if (raw.includes(ENV_PARENT_BRANCH)) return;
+	const parentBranch = process.env[ENV_PARENT_BRANCH] || "(unknown)";
+	const text =
+		`⚠️ ${finishScript} does not honour ${ENV_PARENT_BRANCH}; it would merge into the project's main branch instead of this agent's parent branch \`${parentBranch}\`. ` +
+		"Do NOT run the finish script as-is. Ask the parent agent/user to upgrade the project's side-agent setup (agent-setup skill) or merge manually into the parent branch.";
+	if (ctx.hasUI) ctx.ui.notify(`side-agent: finish script ignores ${ENV_PARENT_BRANCH}`, "warning");
+	pi.sendMessage({ customType: STATUS_UPDATE_MESSAGE_TYPE, content: text, display: true }, { triggerTurn: false });
+}
+
 type ResumeNoticeFile = {
 	/** Unique per resume launch; the child dedups against notices already in the session. */
 	noticeId: string;
@@ -2817,10 +2958,14 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 	const next = new Map<string, AgentStatusSnapshot>();
 	const transitions: StatusTransitionNotice[] = [];
 
+	const self = getSelfIdentity();
+	const liveIds = new Set(agents.map((record) => record.id));
+
 	for (const record of agents) {
 		const currentSnapshot: AgentStatusSnapshot = {
 			status: record.status,
 			tmuxWindowIndex: record.tmuxWindowIndex,
+			parentAgentId: record.parentAgentId,
 		};
 		next.set(record.id, currentSnapshot);
 
@@ -2831,6 +2976,8 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 			fromStatus: previousSnapshot.status,
 			toStatus: record.status,
 			tmuxWindowIndex: record.tmuxWindowIndex ?? previousSnapshot.tmuxWindowIndex,
+			parentAgentId: record.parentAgentId,
+			orphaned: isOrphanRecord(record, self, liveIds),
 		});
 	}
 
@@ -2843,16 +2990,23 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 				fromStatus: previousSnapshot.status,
 				toStatus: "done",
 				tmuxWindowIndex: previousSnapshot.tmuxWindowIndex,
+				parentAgentId: previousSnapshot.parentAgentId,
+				orphaned: isOrphanRecord(previousSnapshot, self, liveIds),
 			});
 		}
 	}
 
 	statusSnapshotsByStateRoot.set(stateRoot, next);
 	if (!previous) return [];
-	return transitions.sort((a, b) => a.id.localeCompare(b.id));
+	// Notification scoping: a session is told only about the agents it spawned
+	// (main additionally adopts orphans whose parent has quit). A grandchild's
+	// transitions reach its parent agent, never the main session.
+	return transitions
+		.filter((transition) => isOwnedBySelf(transition, self, liveIds))
+		.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-type ThemeForeground = { fg: (role: "warning" | "muted" | "accent" | "error", text: string) => string };
+type ThemeForeground = { fg: (role: "dim" | "warning" | "muted" | "accent" | "error", text: string) => string };
 
 function formatStatusWord(status: AgentStatus, theme?: ThemeForeground): string {
 	if (!theme) return status;
@@ -2883,7 +3037,10 @@ function formatStatusTransitionMessage(transition: PendingStatusTransition, them
 			? [transition.fromStatus, ...transition.path]
 			: [transition.fromStatus, transition.toStatus];
 	const route = statuses.map((status) => formatStatusWord(status, theme)).join(" -> ");
-	return `side-agent ${transition.id}: ${route} (${parts.join(", ")})`;
+	const orphan = transition.orphaned
+		? ` [orphaned: its parent agent ${transition.parentAgentId ?? "?"} is gone]`
+		: "";
+	return `side-agent ${transition.id}: ${route} (${parts.join(", ")})${orphan}`;
 }
 
 /**
@@ -2909,6 +3066,7 @@ function mergePendingTransitions(
 		}
 		existing.toStatus = transition.toStatus;
 		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
+		existing.orphaned = existing.orphaned || transition.orphaned;
 		existing.lastObservedAt = now;
 		existing.coalescedCount += 1;
 		if (existing.path.length < TRANSITION_PATH_LIMIT) {
@@ -2962,8 +3120,8 @@ function emitStatusTransitions(
 	transitions: StatusTransitionNotice[],
 	settleMs = TRANSITION_SETTLE_MS,
 ): void {
-	if (isChildRuntime()) return;
-
+	// Runs in every session, nested ones included: collectStatusTransitions()
+	// already narrowed `transitions` to the agents this session spawned.
 	let pending = pendingTransitionsByStateRoot.get(stateRoot);
 	if (!pending) {
 		pending = new Map();
@@ -3007,6 +3165,8 @@ function emitStatusTransitions(
 				display: true,
 				details: {
 					agentId: transition.id,
+					parentAgentId: transition.parentAgentId,
+					orphaned: transition.orphaned ?? false,
 					fromStatus: transition.fromStatus,
 					toStatus: transition.toStatus,
 					tmuxWindowIndex: transition.tmuxWindowIndex,
@@ -3064,11 +3224,8 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 		collectStatusTransitions(stateRoot, agents);
 	}
 
-	// Inside a child agent, hide our own entry — only show siblings.
-	const selfId = process.env[ENV_AGENT_ID];
-	const visible = selfId ? agents.filter((r) => r.id !== selfId) : agents;
-
-	if (visible.length === 0) {
+	const line = formatStatusLine(agents, getSelfIdentity(), ctx.ui.theme);
+	if (line === undefined) {
 		if (lastRenderedStatusLine !== undefined) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			lastRenderedStatusLine = undefined;
@@ -3076,18 +3233,42 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 		return;
 	}
 
-	const theme = ctx.ui.theme;
-	const line = visible
-		.map((record) => {
-			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
-			const entry = `${record.id}:${statusShort(record.status)}${win}`;
-			return theme.fg(statusColorRole(record.status), entry);
-		})
-		.join(" ");
-
 	if (line === lastRenderedStatusLine) return;
 	ctx.ui.setStatus(STATUS_KEY, line);
 	lastRenderedStatusLine = line;
+}
+
+/**
+ * Status line scope: the session's own children first, then (after a
+ * separator, muted) its siblings. Main has no siblings and sees exactly its
+ * direct children plus orphans; a leaf grandchild sees only its siblings.
+ * Returns undefined when there is nothing to show.
+ */
+function formatStatusLine(
+	agents: AgentRecord[],
+	self: SelfIdentity,
+	theme: ThemeForeground,
+): string | undefined {
+	const liveIds = new Set(agents.map((record) => record.id));
+	const children: AgentRecord[] = [];
+	const siblings: AgentRecord[] = [];
+	for (const record of agents) {
+		if (isOwnedBySelf(record, self, liveIds)) children.push(record);
+		else if (isSiblingRecord(record, self)) siblings.push(record);
+	}
+	if (children.length === 0 && siblings.length === 0) return undefined;
+
+	const entry = (record: AgentRecord): string => {
+		const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
+		const orphan = isOrphanRecord(record, self, liveIds) ? "[orphan]" : "";
+		return `${record.id}:${statusShort(record.status)}${win}${orphan}`;
+	};
+	const parts = children.map((record) => theme.fg(statusColorRole(record.status), entry(record)));
+	if (siblings.length > 0) {
+		if (parts.length > 0) parts.push(theme.fg("dim", "│"));
+		parts.push(theme.fg("dim", "sib:"), ...siblings.map((record) => theme.fg("dim", entry(record))));
+	}
+	return parts.join(" ");
 }
 
 function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
@@ -3143,6 +3324,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 				const lines = [
 					`id: ${started.id}`,
+					...(started.parentAgentId ? [`parent agent: ${started.parentAgentId} (depth ${started.depth})`] : []),
 					`tmux window: ${started.tmuxWindowId} (#${started.tmuxWindowIndex})`,
 					`worktree: ${started.worktreePath}`,
 					`branch: ${started.branch}`,
@@ -3183,20 +3365,47 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				lines.push("(no tracked agents)");
 			} else {
 				const theme = ctx.hasUI ? ctx.ui.theme : undefined;
-				for (const [index, record] of records.entries()) {
+				const self = getSelfIdentity();
+				const liveIds = new Set(records.map((record) => record.id));
+				// Full tree for everyone (this is an explicit command): roots are
+				// main's children plus orphans, nested agents indented under their parent.
+				const byParent = new Map<string | undefined, AgentRecord[]>();
+				for (const record of records) {
+					const key = record.parentAgentId !== undefined && liveIds.has(record.parentAgentId) ? record.parentAgentId : undefined;
+					const bucket = byParent.get(key) ?? [];
+					bucket.push(record);
+					byParent.set(key, bucket);
+				}
+				const ordered: { record: AgentRecord; level: number }[] = [];
+				const visit = (parentId: string | undefined, level: number) => {
+					for (const record of byParent.get(parentId) ?? []) {
+						ordered.push({ record, level });
+						visit(record.id, level + 1);
+					}
+				};
+				visit(undefined, 0);
+
+				for (const [index, { record, level }] of ordered.entries()) {
+					const indent = "  ".repeat(level);
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
 					const statusWord = formatStatusWord(record.status, theme);
 					const winPrefix = formatLabelPrefix("win:", theme);
 					const worktreePrefix = formatLabelPrefix("worktree:", theme);
 					const taskPrefix = formatLabelPrefix("task:", theme);
-					lines.push(`${record.id}  ${statusWord}  ${winPrefix}${win}  ${worktreePrefix}${worktreeName}`);
-					lines.push(`  ${taskPrefix} ${summarizeTask(record.task)}`);
-					if (record.error) lines.push(`  error: ${record.error}`);
-					if (record.status === "failed" || record.status === "crashed") {
+					const marks: string[] = [];
+					if (record.id === self.selfId) marks.push("(this session)");
+					if (level > 0) marks.push(`${formatLabelPrefix("parent:", theme)}${record.parentAgentId}`);
+					if (isOrphanRecord(record, self, liveIds)) marks.push(`orphan (parent ${record.parentAgentId} gone)`);
+					const markText = marks.length > 0 ? `  ${marks.join("  ")}` : "";
+					lines.push(`${indent}${record.id}  ${statusWord}  ${winPrefix}${win}  ${worktreePrefix}${worktreeName}${markText}`);
+					lines.push(`${indent}  ${taskPrefix} ${summarizeTask(record.task)}`);
+					if (record.error) lines.push(`${indent}  error: ${record.error}`);
+					// Only offer to clean up what this session is responsible for.
+					if ((record.status === "failed" || record.status === "crashed") && isOwnedBySelf(record, self, liveIds)) {
 						failedIds.push(record.id);
 					}
-					if (index < records.length - 1) {
+					if (index < ordered.length - 1) {
 						lines.push("");
 					}
 				}
@@ -3431,7 +3640,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Returns { ok: true, id, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 2); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
@@ -3453,6 +3662,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 								{
 									ok: true,
 									id: started.id,
+									parentAgentId: started.parentAgentId,
+									depth: started.depth,
 									task: params.description.length > 200 ? params.description.slice(0, 200) + "…" : params.description,
 									tmuxWindowId: started.tmuxWindowId,
 									tmuxWindowIndex: started.tmuxWindowIndex,
@@ -3484,7 +3695,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-check",
 		label: "Agent Check",
 		description:
-			"Check a given side agent status and return compact recent output. Returns { ok: true, agent: { id, status, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. backlog is sanitized/truncated for LLM safety; task is a compact preview. Statuses: allocating_worktree | spawning_tmux | running | waiting_user | failed | crashed. Agents that exit with code 0 are auto-removed from registry.",
+			"Check a given side agent status and return compact recent output. Returns { ok: true, agent: { id, status, parentAgentId?, depth, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, task, startedAt, finishedAt?, exitCode?, error?, warnings[] }, backlog: string[] }, or { ok: false, error } if the agent id is unknown or a registry error occurs. backlog is sanitized/truncated for LLM safety; task is a compact preview. Statuses: allocating_worktree | spawning_tmux | running | waiting_user | failed | crashed. Agents that exit with code 0 are auto-removed from registry.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
 		}),
@@ -3563,6 +3774,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			await injectResumeNoticeIfPresent(pi, ctx).catch((err) => {
 				if (ctx.hasUI) ctx.ui.notify(`side-agent: failed to inject resume notice: ${stringifyError(err)}`, "warning");
 			});
+			await warnIfFinishScriptIgnoresParentBranch(pi, ctx).catch(() => {});
 		}
 		ensureStatusPoller(pi, ctx);
 	});
@@ -3570,7 +3782,6 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		// Last chance to persist buffered notices: skip the settle window so a
 		// still-quiet transition is not lost with the process.
-		if (isChildRuntime()) return;
 		emitStatusTransitions(pi, ctx, getStateRoot(ctx), [], 0);
 	});
 
