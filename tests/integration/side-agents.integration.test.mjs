@@ -177,8 +177,10 @@ function sendLiteral(harness, target, text) {
 }
 
 function sendEnter(harness, target) {
-	// "Enter" (the key), not "C-m": pi enables tmux extended keys, and a raw
-	// carriage return is not recognised as submit by its editor anymore.
+	// "Enter" (the key), not "C-m". pi-tui enables xterm modifyOtherKeys level 2
+	// (CSI > 4;2 m); under that mode tmux >= 3.3 encodes the key named C-m as a
+	// genuine Ctrl+m (CSI 27;5;109~) instead of the legacy byte 0x0d, so pi sees
+	// Ctrl+M, not Enter, and does not submit. Enter is still sent as \r.
 	tmux(harness, ["send-keys", "-t", target, "Enter"]);
 }
 
