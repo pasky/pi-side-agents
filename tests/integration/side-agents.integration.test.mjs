@@ -834,8 +834,8 @@ test(
 
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send /quit should succeed: ${JSON.stringify(quitSend.payload)}`);
-		await waitForBacklogContains(harness, agentId, "/quit", 90_000);
-
+		// pi >= 0.85 no longer echoes a submitted slash command into the transcript,
+		// so the effect (child exits, record pruned) is the observable, not the text.
 		await waitForAgentRemoved(harness, agentId, 120_000);
 		assert.ok(await exists(join(runtimeDir, "exit.json")), "exit.json should be created when child exits");
 		const exitPayload = JSON.parse(await readFile(join(runtimeDir, "exit.json"), "utf8"));
@@ -1743,15 +1743,21 @@ test(
 			{ timeoutMs: 90_000, intervalMs: 1_000 },
 		);
 
-		// 4. Depth cap: inner may not spawn.
-		const tooDeep = await callToolInChildSession(harness, inner.tmuxWindowId, innerSessionPath, "agent-start", {
-			description: "should be refused",
-			branchHint: "too-deep",
-			model: MODEL_SPEC,
-		});
-		assert.equal(tooDeep.payload.ok, false, `depth-3 agent-start must fail: ${JSON.stringify(tooDeep.payload)}`);
-		assert.match(String(tooDeep.payload.error), /Nesting limit/);
-		assert.equal((await readRegistry(harness)).agents["too-deep"], undefined);
+		// 4. Depth cap: inner may not spawn. Drive it through the slash command so
+		// the check does not hinge on the inner model agreeing to call the tool.
+		await sendChildCommand(harness, inner.tmuxWindowId, `/agent -model ${MODEL_SPEC} too deep: must be refused`);
+		await waitFor(
+			"inner pane to show the nesting-limit error",
+			async () => normalizeScreen(await capturePane(harness, inner.tmuxWindowId, 200)).includes("Nesting limit reached"),
+			{ timeoutMs: 30_000, intervalMs: 500 },
+		);
+		await sleep(2_000);
+		const afterTooDeep = await readRegistry(harness);
+		assert.deepStrictEqual(
+			Object.keys(afterTooDeep.agents).sort(),
+			["inner", "outer"],
+			"no depth-3 record may be created",
+		);
 
 		// 5. inner quits → outer gets the terminal notice; main still hears nothing about inner.
 		await sendChildCommand(harness, inner.tmuxWindowId, "/quit");

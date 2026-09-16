@@ -73,6 +73,10 @@ type AgentRecord = {
 	parentAgentId?: string;
 	/** Nesting depth (1 = spawned by main). Missing on records from older versions ⇒ 1. */
 	depth?: number;
+	/** Nested agents only: the parent agent's worktree — the checkout the finish
+	 * script merges into. Kept here (not just on the parent record) so the slot
+	 * stays reserved even after the parent quits and its record is pruned. */
+	parentWorktreePath?: string;
 	childSessionId?: string;
 	tmuxSession?: string;
 	tmuxWindowId?: string;
@@ -170,6 +174,9 @@ type StatusTransitionNotice = {
 	parentAgentId?: string;
 	/** The agent's parent was pruned from the registry (it quit while this one still ran). */
 	orphaned?: boolean;
+	/** Main-only: the agent just became an orphan; emitted even without a status
+	 * change so main learns it now owns an agent that may already be waiting/failed. */
+	adopted?: boolean;
 };
 
 /**
@@ -189,6 +196,7 @@ type AgentStatusSnapshot = {
 	status: AgentStatus;
 	tmuxWindowIndex?: number;
 	parentAgentId?: string;
+	orphaned?: boolean;
 };
 
 /** Identity of the running session within the agent tree. */
@@ -1130,10 +1138,14 @@ async function allocateWorktree(options: {
 	// Build a set of worktree paths claimed by active (non-terminal) agents in the registry,
 	// so we can reject slots even if the lock file was inadvertently cleaned up.
 	const claimedByActiveAgent = new Set<string>();
+	// Worktrees a live nested agent will merge into. Reusing such a slot for a
+	// new agent would let the nested agent's finish script `git checkout` the
+	// (possibly pruned) parent's branch inside the newcomer's worktree.
+	const pinnedAsParentCheckout = new Set<string>();
 	for (const record of Object.values(registry.agents)) {
-		if (record.id !== agentId && record.worktreePath && !isTerminalStatus(record.status)) {
-			claimedByActiveAgent.add(resolve(record.worktreePath));
-		}
+		if (record.id === agentId || isTerminalStatus(record.status)) continue;
+		if (record.worktreePath) claimedByActiveAgent.add(resolve(record.worktreePath));
+		if (record.parentWorktreePath) pinnedAsParentCheckout.add(resolve(record.parentWorktreePath));
 	}
 
 	// Resume mode: if the branch still exists and is still checked out in one of
@@ -1186,6 +1198,12 @@ async function allocateWorktree(options: {
 		// Check 2: registry claims this worktree for an active agent (even if lock is missing).
 		if (claimedByActiveAgent.has(resolvedSlotPath)) {
 			warnings.push(`Worktree claimed by active agent in registry (missing lock): ${slot.path}`);
+			continue;
+		}
+
+		// Check 3: a live nested agent still has to merge into this worktree.
+		if (pinnedAsParentCheckout.has(resolvedSlotPath)) {
+			warnings.push(`Worktree is the merge target of a live nested agent, skipping: ${slot.path}`);
 			continue;
 		}
 
@@ -2279,7 +2297,10 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 	// ...but a nested agent bases the new branch on ITS checkout, and that is
 	// where the child's finish script will fast-forward into.
 	const parentCheckout = self.selfId ? resolveGitRoot(ctx.cwd) : repoRoot;
-	const parentBranch = getCurrentBranch(parentCheckout);
+	// Only a nested agent gets an explicit merge-target branch; main's children
+	// keep integrating into the branch configured at agent-setup time, whatever
+	// main happens to have checked out right now.
+	const parentBranch = self.selfId ? getCurrentBranch(parentCheckout) : "";
 	if (self.selfId && !parentBranch) {
 		throw new Error(`Cannot spawn a nested agent: ${parentCheckout} is not on a branch (detached HEAD)`);
 	}
@@ -2327,6 +2348,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 				parentSessionId,
 				parentAgentId: self.selfId,
 				depth,
+				parentWorktreePath: self.selfId ? parentCheckout : undefined,
 				task: params.task,
 				model: params.model,
 				status: "allocating_worktree",
@@ -2442,34 +2464,46 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 				? "session"
 				: "fork"
 			: undefined;
-		if (params.resume && (resumeSessionMode === "fork" || !worktree.workingTreePreserved)) {
+		const treeChanged = resumeSessionMode === "fork" || !worktree.workingTreePreserved;
+		if (params.resume && (treeChanged || self.selfId)) {
 			// The conversation history refers to paths/state of the original cwd
 			// and working tree; when either changed, the child injects a prominent
 			// notice on startup so the model stops acting on stale assumptions.
+			// A resume from inside a side agent also (re)parents the session — its
+			// history may name a different parent and merge target.
 			const dirChanged = resumeSessionMode === "fork";
 			const notice: ResumeNoticeFile = {
 				noticeId: `${agentId}:${now}`,
 				targetCwd: worktree.worktreePath,
 				sourceSessionPath: resolve(params.resume.sessionPath),
 				content: buildResumeNotice({
+					treeChanged,
 					dirChanged,
 					originalCwd: params.resume.sessionCwd,
 					newCwd: worktree.worktreePath,
 					branch: worktree.branch,
 					branchReattached: worktree.branchReattached,
 					workingTreePreserved: worktree.workingTreePreserved,
+					nested: self.selfId ? { parentAgentId: self.selfId, parentBranch, parentCheckout, depth } : undefined,
 				}),
 			};
 			await atomicWrite(join(runtimeDir, RESUME_NOTICE_FILE), JSON.stringify(notice, null, 2) + "\n");
-			aggregatedWarnings.push(
-				dirChanged
-					? `Resumed in ${worktree.worktreePath}, not the session's original directory ${
-							params.resume.sessionCwd ?? "(unknown)"
-						}; a directory-change notice is injected into the child session.`
-					: `Resumed in a reset working tree (branch ${worktree.branch}${
-							worktree.branchReattached ? " reattached" : " recreated from HEAD"
-						}); a notice is injected into the child session.`,
-			);
+			if (treeChanged) {
+				aggregatedWarnings.push(
+					dirChanged
+						? `Resumed in ${worktree.worktreePath}, not the session's original directory ${
+								params.resume.sessionCwd ?? "(unknown)"
+							}; a directory-change notice is injected into the child session.`
+						: `Resumed in a reset working tree (branch ${worktree.branch}${
+								worktree.branchReattached ? " reattached" : " recreated from HEAD"
+							}); a notice is injected into the child session.`,
+				);
+			}
+			if (self.selfId) {
+				aggregatedWarnings.push(
+					`Resumed as a nested agent under ${self.selfId} (merge target ${parentBranch}); a re-parenting notice is injected into the child session.`,
+				);
+			}
 		}
 
 		const tmuxSession = getCurrentTmuxSession();
@@ -2861,13 +2895,28 @@ type ResumeNoticeFile = {
 };
 
 function buildResumeNotice(options: {
+	/** Directory and/or working tree differ from what the session last saw. */
+	treeChanged: boolean;
 	dirChanged: boolean;
 	originalCwd?: string;
 	newCwd: string;
 	branch: string;
 	branchReattached: boolean;
 	workingTreePreserved: boolean;
+	/** Set when the resume was issued from inside a side agent. */
+	nested?: { parentAgentId: string; parentBranch: string; parentCheckout: string; depth: number };
 }): string {
+	const nestedNotice = options.nested
+		? [
+				"⚠️ RE-PARENTED — this session was resumed by side agent " +
+					`\`${options.nested.parentAgentId}\` (you are now at nesting depth ${options.nested.depth}), not by the main session.`,
+				"",
+				`Your merge target is now its branch \`${options.nested.parentBranch}\` (checked out at ${options.nested.parentCheckout}), ` +
+					"regardless of what earlier instructions in this conversation said. Report to that agent; it tells you when to merge.",
+			].join("\n")
+		: "";
+	if (!options.treeChanged) return nestedNotice;
+	const withNested = (text: string) => (nestedNotice ? `${text}\n\n${nestedNotice}` : text);
 	const original = options.originalCwd ?? "(unknown)";
 	let branchLine: string;
 	if (options.workingTreePreserved) {
@@ -2875,18 +2924,20 @@ function buildResumeNotice(options: {
 	} else if (options.branchReattached) {
 		branchLine = `Branch \`${options.branch}\` was reattached with its committed history, but the working tree was reset to it; uncommitted changes from before are NOT present.`;
 	} else {
-		branchLine = `This session now runs on a fresh branch \`${options.branch}\` created from the main worktree's HEAD, in a reset working tree; earlier uncommitted or unmerged work from this conversation is NOT present here.`;
+		branchLine = `This session now runs on a fresh branch \`${options.branch}\` created from the ${
+			options.nested ? "parent agent's" : "main worktree's"
+		} HEAD, in a reset working tree; earlier uncommitted or unmerged work from this conversation is NOT present here.`;
 	}
 	if (!options.dirChanged) {
-		return [
+		return withNested([
 			"⚠️ WORKING TREE RESET — this session was resumed in its directory, but the working tree is not in the state you left it.",
 			"",
 			branchLine,
 			"",
 			"Re-inspect the working tree (`git status`, `git log`) before continuing; do not assume files are in the state you remember.",
-		].join("\n");
+		].join("\n"));
 	}
-	return [
+	return withNested([
 		"⚠️ WORKING DIRECTORY CHANGED — this session was resumed in a DIFFERENT directory.",
 		"",
 		`- Previous directory (used before this notice): ${original}`,
@@ -2897,7 +2948,7 @@ function buildResumeNotice(options: {
 		`Resolve any path from earlier in this conversation that pointed under ${original} against ${options.newCwd} instead; such files may be missing or differ here. ` +
 			"Run all commands, reads and edits against the current directory; do NOT read from or modify the previous directory (it may be in use by another agent or no longer exist). " +
 			"Re-inspect the working tree (`git status`, `git log`) before continuing.",
-	].join("\n");
+	].join("\n"));
 }
 
 /** Child side, on process startup: append the parent's resume notice (if any)
@@ -2962,22 +3013,27 @@ function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): Sta
 	const liveIds = new Set(agents.map((record) => record.id));
 
 	for (const record of agents) {
+		const orphaned = isOrphanRecord(record, self, liveIds);
 		const currentSnapshot: AgentStatusSnapshot = {
 			status: record.status,
 			tmuxWindowIndex: record.tmuxWindowIndex,
 			parentAgentId: record.parentAgentId,
+			orphaned,
 		};
 		next.set(record.id, currentSnapshot);
 
 		const previousSnapshot = previous?.get(record.id);
-		if (!previousSnapshot || previousSnapshot.status === record.status) continue;
+		if (!previousSnapshot) continue;
+		const adopted = orphaned && !previousSnapshot.orphaned;
+		if (previousSnapshot.status === record.status && !adopted) continue;
 		transitions.push({
 			id: record.id,
 			fromStatus: previousSnapshot.status,
 			toStatus: record.status,
 			tmuxWindowIndex: record.tmuxWindowIndex ?? previousSnapshot.tmuxWindowIndex,
 			parentAgentId: record.parentAgentId,
-			orphaned: isOrphanRecord(record, self, liveIds),
+			orphaned,
+			adopted,
 		});
 	}
 
@@ -3031,14 +3087,18 @@ function formatStatusTransitionMessage(transition: PendingStatusTransition, them
 
 	// A cycle (waiting_user -> running -> waiting_user) has identical endpoints
 	// but is real news — the child did another round of work. Spell out the
-	// route in that case so it does not read as a no-op.
+	// route in that case so it does not read as a no-op. An adoption notice with
+	// no status change at all just states the current status.
+	const unchanged = transition.path.every((status) => status === transition.fromStatus);
 	const statuses =
 		transition.fromStatus === transition.toStatus
-			? [transition.fromStatus, ...transition.path]
+			? unchanged
+				? [transition.toStatus]
+				: [transition.fromStatus, ...transition.path]
 			: [transition.fromStatus, transition.toStatus];
 	const route = statuses.map((status) => formatStatusWord(status, theme)).join(" -> ");
 	const orphan = transition.orphaned
-		? ` [orphaned: its parent agent ${transition.parentAgentId ?? "?"} is gone]`
+		? ` [orphaned: its parent agent ${transition.parentAgentId ?? "?"} is gone${transition.adopted ? "; now reporting here" : ""}]`
 		: "";
 	return `side-agent ${transition.id}: ${route} (${parts.join(", ")})${orphan}`;
 }
@@ -3067,6 +3127,7 @@ function mergePendingTransitions(
 		existing.toStatus = transition.toStatus;
 		existing.tmuxWindowIndex = transition.tmuxWindowIndex ?? existing.tmuxWindowIndex;
 		existing.orphaned = existing.orphaned || transition.orphaned;
+		existing.adopted = existing.adopted || transition.adopted;
 		existing.lastObservedAt = now;
 		existing.coalescedCount += 1;
 		if (existing.path.length < TRANSITION_PATH_LIMIT) {

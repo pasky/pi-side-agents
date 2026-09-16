@@ -1408,3 +1408,57 @@ test("nested: depth cap — grandchildren cannot spawn", () => {
 	assert.strictEqual(canSpawn(A), true);
 	assert.strictEqual(canSpawn(A1), false);
 });
+
+/**
+ * Contract copy of the per-record step of collectStatusTransitions (main's
+ * view): a transition is produced on a status change OR when the record just
+ * became an orphan (adoption), so main is told about agents it inherits even
+ * when they are already settled in waiting_user/failed.
+ */
+function collectTransitionsPort(previous, agents, self) {
+	const liveIds = new Set(agents.map((r) => r.id));
+	const next = new Map();
+	const transitions = [];
+	for (const record of agents) {
+		const orphaned = isOrphanRecordPort(record, self, liveIds);
+		next.set(record.id, { status: record.status, parentAgentId: record.parentAgentId, orphaned });
+		const prev = previous?.get(record.id);
+		if (!prev) continue;
+		const adopted = orphaned && !prev.orphaned;
+		if (prev.status === record.status && !adopted) continue;
+		transitions.push({
+			id: record.id,
+			fromStatus: prev.status,
+			toStatus: record.status,
+			parentAgentId: record.parentAgentId,
+			orphaned,
+			adopted,
+		});
+	}
+	const owned = transitions.filter((t) => isOwnedBySelfPort(t, self, liveIds));
+	return { next, transitions: owned };
+}
+
+test("nested: main gets an adoption notice for an already-failed grandchild when its parent quits", () => {
+	const tick1 = [
+		{ id: "a", parentAgentId: undefined, status: "running" },
+		{ id: "a1", parentAgentId: "a", status: "running" },
+	];
+	const tick2 = [
+		{ id: "a", parentAgentId: undefined, status: "running" },
+		{ id: "a1", parentAgentId: "a", status: "failed" }, // fails while `a` is alive → a's business
+	];
+	const tick3 = [
+		{ id: "a1", parentAgentId: "a", status: "failed" }, // `a` quit and was pruned; a1 unchanged
+	];
+	let state = collectTransitionsPort(undefined, tick1, MAIN);
+	state = collectTransitionsPort(state.next, tick2, MAIN);
+	assert.deepStrictEqual(state.transitions, [], "main must not be told about a1 while a is alive");
+	state = collectTransitionsPort(state.next, tick3, MAIN);
+	assert.deepStrictEqual(state.transitions, [
+		{ id: "a1", fromStatus: "failed", toStatus: "failed", parentAgentId: "a", orphaned: true, adopted: true },
+	]);
+	// Nothing further once adopted (no repeated adoption notices).
+	state = collectTransitionsPort(state.next, tick3, MAIN);
+	assert.deepStrictEqual(state.transitions, []);
+});

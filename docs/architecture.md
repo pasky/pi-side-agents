@@ -193,7 +193,7 @@ The launcher exports (at minimum):
 - `PI_SIDE_AGENT_ID`
 - `PI_SIDE_PARENT_SESSION`
 - `PI_SIDE_PARENT_REPO` — the spawning session's checkout: the main repo, or the parent agent's worktree for a nested agent
-- `PI_SIDE_PARENT_BRANCH` — the branch checked out there (the finish script's merge target)
+- `PI_SIDE_PARENT_BRANCH` — nested agents only: the parent agent's branch (the finish script's merge target); empty for main's children, which keep integrating into the branch configured at agent-setup time
 - `PI_SIDE_PARENT_AGENT_ID` — empty when spawned by the main session
 - `PI_SIDE_AGENT_DEPTH` — `1` for main's children, `2` for their children
 - `PI_SIDE_AGENTS_ROOT` — always the main repo, so all levels share one registry
@@ -208,7 +208,9 @@ A side agent may itself call `agent-start` (or `/agent`); depth is capped at `MA
 - Registry, id de-duplication and worktree slots are shared across all levels (`PI_SIDE_AGENTS_ROOT` is inherited). Records carry `parentAgentId` and `depth`.
 - The grandchild's tmux window is opened in the same tmux session as everything else.
 - The grandchild's branch is created from the **parent agent's HEAD**, and `PI_SIDE_PARENT_REPO`/`PI_SIDE_PARENT_BRANCH` point at the parent agent's worktree/branch, so the (skill-templated) finish script fast-forwards the parent agent's branch. Its kickoff prompt says so explicitly. A grandchild whose project finish script predates `PI_SIDE_PARENT_BRANCH` gets a warning at startup.
-- **Notification scoping**: lifecycle notices (`side-agent-status` messages, failure toasts) for an agent go only to the session that spawned it. The main session never hears about grandchildren — unless their parent quit (records get auto-pruned on exit 0), in which case such *orphans* are adopted by main and flagged `[orphaned]`.
+- **Notification scoping**: lifecycle notices (`side-agent-status` messages, failure toasts) for an agent go only to the session that spawned it. The main session never hears about grandchildren — unless their parent quit (records get auto-pruned on exit 0), in which case such *orphans* are adopted by main: an adoption notice is emitted at once (even if the orphan's status did not change, so an already failed/waiting grandchild is not silently inherited) and later notices are flagged `[orphaned]`.
+- Records of nested agents carry `parentWorktreePath`; `allocateWorktree` refuses to hand that slot to a new agent while the nested agent lives, and the finish-script template exits 4 instead of `git checkout` when a nested parent checkout is not on the expected branch — together these stop an orphan's merge from switching branches inside a slot that was recycled to someone else.
+- `/agent-resume` issued from inside a side agent re-parents the resumed session (new `parentAgentId`/`depth`, branch preserved); a re-parenting notice is injected into the resumed conversation.
 - Status line scope per session: its own children (plain), then its siblings (muted, after a `│ sib:` separator). Main therefore sees exactly its direct children (+ orphans); a leaf grandchild sees its siblings only.
 - `/agents` shows the full tree everywhere (nested agents indented, orphans flagged); its "clean up failed agents" prompt only offers the session's own children.
 - `agent-check` / `agent-wait-any` / `agent-send` stay global by id.
