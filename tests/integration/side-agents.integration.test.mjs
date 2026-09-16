@@ -21,7 +21,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PROJECT_ROOT = resolve(process.cwd());
 const EXTENSION_SOURCE = resolve(PROJECT_ROOT, "extensions/side-agents.ts");
-const MODEL_SPEC = process.env.PI_SIDE_IT_MODEL ?? "openai-codex/gpt-5.1-codex-mini";
+const MODEL_SPEC = process.env.PI_SIDE_IT_MODEL ?? "openai-codex/gpt-5.5";
 const AUTH_SOURCE = join(homedir(), ".pi", "agent", "auth.json");
 const TEST_TIMEOUT = Number(process.env.PI_SIDE_IT_TIMEOUT_MS ?? 240_000);
 
@@ -177,13 +177,23 @@ function sendLiteral(harness, target, text) {
 }
 
 function sendEnter(harness, target) {
-	tmux(harness, ["send-keys", "-t", target, "C-m"]);
+	// "Enter" (the key), not "C-m": pi enables tmux extended keys, and a raw
+	// carriage return is not recognised as submit by its editor anymore.
+	tmux(harness, ["send-keys", "-t", target, "Enter"]);
+}
+
+/** Type a line into a pi pane and submit it. The pause before Enter matters:
+ * pi's editor treats a fast keystroke burst as a paste, and an Enter arriving
+ * inside that burst is folded into the pasted text instead of submitting. */
+async function sendLineToPane(harness, target, command) {
+	sendLiteral(harness, target, command);
+	await sleep(400);
+	sendEnter(harness, target);
+	await sleep(120);
 }
 
 async function sendParentCommand(harness, command) {
-	sendLiteral(harness, harness.parentTarget, command);
-	sendEnter(harness, harness.parentTarget);
-	await sleep(120);
+	await sendLineToPane(harness, harness.parentTarget, command);
 }
 
 async function readRegistry(harness) {
@@ -646,6 +656,9 @@ async function createHarness(t, options = {}) {
 				defaultProvider: provider,
 				defaultModel: modelId,
 				defaultThinkingLevel: "minimal",
+				// Newer pi asks "Trust project folder?" before loading .pi/extensions;
+				// the fixture repo (and every child worktree) must load ours unattended.
+				defaultProjectTrust: "always",
 				packages: [],
 			},
 			null,
@@ -696,7 +709,8 @@ exec pi --model ${JSON.stringify(MODEL_SPEC)} --thinking minimal --session-dir $
 		"parent pi startup",
 		async () => {
 			const pane = normalizeScreen(await captureParent(harness));
-			return pane.includes("/ for commands") && pane.includes("side-agents.ts");
+			// Banner wording differs across pi versions ("/ for commands" vs "/ commands").
+			return /\/ (?:for )?commands/.test(pane) && pane.includes("side-agents.ts");
 		},
 		{ timeoutMs: 90_000, intervalMs: 300 },
 	);
