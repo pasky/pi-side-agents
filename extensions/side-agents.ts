@@ -3300,8 +3300,8 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 }
 
 /**
- * Status line scope: the session's own children first, then (after a
- * separator, muted) its siblings. Main has no siblings and sees exactly its
+ * Status line scope: the session's own children first, then (after a `|`
+ * separator when both are present, muted) its siblings. Main has no siblings and sees exactly its
  * direct children plus orphans; a leaf grandchild sees only its siblings.
  * Returns undefined when there is nothing to show.
  */
@@ -3326,8 +3326,8 @@ function formatStatusLine(
 	};
 	const parts = children.map((record) => theme.fg(statusColorRole(record.status), entry(record)));
 	if (siblings.length > 0) {
-		if (parts.length > 0) parts.push(theme.fg("dim", "│"));
-		parts.push(theme.fg("dim", "sib:"), ...siblings.map((record) => theme.fg("dim", entry(record))));
+		if (parts.length > 0) parts.push(theme.fg("dim", "|"));
+		parts.push(...siblings.map((record) => theme.fg("dim", entry(record))));
 	}
 	return parts.join(" ");
 }

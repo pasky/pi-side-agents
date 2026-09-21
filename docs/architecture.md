@@ -211,7 +211,7 @@ A side agent may itself call `agent-start` (or `/agent`); depth is capped at `MA
 - **Notification scoping**: lifecycle notices (`side-agent-status` messages, failure toasts) for an agent go only to the session that spawned it. The main session never hears about grandchildren — unless their parent quit (records get auto-pruned on exit 0), in which case such *orphans* are adopted by main: an adoption notice is emitted at once (even if the orphan's status did not change, so an already failed/waiting grandchild is not silently inherited) and later notices are flagged `[orphaned]`.
 - Records of nested agents carry `parentWorktreePath`; `allocateWorktree` refuses to hand that slot to a new agent while the nested agent lives, and the finish-script template exits 4 instead of `git checkout` when a nested parent checkout is not on the expected branch — together these stop an orphan's merge from switching branches inside a slot that was recycled to someone else.
 - `/agent-resume` issued from inside a side agent re-parents the resumed session (new `parentAgentId`/`depth`, branch preserved); a re-parenting notice is injected into the resumed conversation.
-- Status line scope per session: its own children (plain), then its siblings (muted, after a `│ sib:` separator). Main therefore sees exactly its direct children (+ orphans); a leaf grandchild sees its siblings only.
+- Status line scope per session: its own children (plain), then its siblings (muted, after a `|` separator when both are present). Main therefore sees exactly its direct children (+ orphans); a leaf grandchild sees its siblings only.
 - `/agents` shows the full tree everywhere (nested agents indented, orphans flagged); its "clean up failed agents" prompt only offers the session's own children.
 - `agent-check` / `agent-wait-any` / `agent-send` stay global by id.
 
@@ -277,7 +277,7 @@ Example:
 
 - `fix-auth-leak:wait@3 add-auth-tests:run@5`
 
-Inside a side agent, own children come first and siblings follow after a muted `│ sib:` separator (see 6.4).
+Inside a side agent, own children come first and siblings follow, muted, after a `|` separator (see 6.4).
 
 ## 9) Child lifecycle scripts (project-local)
 
