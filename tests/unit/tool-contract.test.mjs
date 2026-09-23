@@ -1327,7 +1327,7 @@ function isSiblingRecordPort(record, self) {
 	return record.parentAgentId === self.parentAgentId;
 }
 
-/** Status-line scope: own children first, then siblings. */
+/** Status-line scope: parent (nested agents only), own children, then siblings. */
 function statusLineScopePort(agents, self) {
 	const liveIds = new Set(agents.map((r) => r.id));
 	const children = [];
@@ -1336,7 +1336,7 @@ function statusLineScopePort(agents, self) {
 		if (isOwnedBySelfPort(record, self, liveIds)) children.push(record.id);
 		else if (isSiblingRecordPort(record, self)) siblings.push(record.id);
 	}
-	return { children, siblings };
+	return { parent: self.parentAgentId, children, siblings };
 }
 
 /** Notification scope: transitions routed to this session. */
@@ -1390,16 +1390,23 @@ test("nested: notifications go to the direct parent only; orphans fall back to m
 	assert.strictEqual(isOrphanRecordPort(withoutA[0], A1, live), false);
 });
 
-test("nested: status line shows own children + siblings", () => {
+test("nested: status line shows parent (if not main) + own children + siblings", () => {
 	// main: direct children (+ orphans); "siblings" collapse into the same set.
-	assert.deepStrictEqual(statusLineScopePort(TREE, MAIN), { children: ["a", "b", "z1"], siblings: [] });
-	// depth-1 agent: its children, then its siblings (self excluded).
-	assert.deepStrictEqual(statusLineScopePort(TREE, A), { children: ["a1", "a2"], siblings: ["b"] });
-	// leaf grandchild: siblings only.
-	assert.deepStrictEqual(statusLineScopePort(TREE, A1), { children: [], siblings: ["a2"] });
+	assert.deepStrictEqual(statusLineScopePort(TREE, MAIN), {
+		parent: undefined,
+		children: ["a", "b", "z1"],
+		siblings: [],
+	});
+	// depth-1 agent: parent is main → not shown; its children, then its siblings (self excluded).
+	assert.deepStrictEqual(statusLineScopePort(TREE, A), { parent: undefined, children: ["a1", "a2"], siblings: ["b"] });
+	// leaf grandchild: its side-agent parent, then siblings (parent is not also listed as a sibling).
+	assert.deepStrictEqual(statusLineScopePort(TREE, A1), { parent: "a", children: [], siblings: ["a2"] });
+	// an only-child grandchild still gets a status line thanks to the parent entry
+	const lone = [{ id: "a", depth: 1 }, { id: "a1", parentAgentId: "a", depth: 2 }];
+	assert.deepStrictEqual(statusLineScopePort(lone, A1), { parent: "a", children: [], siblings: [] });
 	// an orphan is not a sibling of main's children in a child's view
 	const B = getSelfIdentityPort({ PI_SIDE_AGENT_ID: "b", PI_SIDE_AGENT_DEPTH: "1" });
-	assert.deepStrictEqual(statusLineScopePort(TREE, B), { children: [], siblings: ["a"] });
+	assert.deepStrictEqual(statusLineScopePort(TREE, B), { parent: undefined, children: [], siblings: ["a"] });
 });
 
 test("nested: depth cap — grandchildren cannot spawn", () => {

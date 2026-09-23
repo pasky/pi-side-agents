@@ -3300,10 +3300,12 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 }
 
 /**
- * Status line scope: the session's own children first, then (after a `|`
- * separator when both are present, muted) its siblings. Main has no siblings and sees exactly its
- * direct children plus orphans; a leaf grandchild sees only its siblings.
- * Returns undefined when there is nothing to show.
+ * Status line scope: for a nested agent (parent is another side agent, not
+ * main) a `parent:` entry first, so it is clear whose subtree this session
+ * lives in; then the session's own children, then (muted) its siblings —
+ * groups separated by `|`. Main has no parent/siblings and sees exactly its
+ * direct children plus orphans; a leaf grandchild sees its parent and
+ * siblings. Returns undefined when there is nothing to show.
  */
 function formatStatusLine(
 	agents: AgentRecord[],
@@ -3317,19 +3319,31 @@ function formatStatusLine(
 		if (isOwnedBySelf(record, self, liveIds)) children.push(record);
 		else if (isSiblingRecord(record, self)) siblings.push(record);
 	}
-	if (children.length === 0 && siblings.length === 0) return undefined;
+	const parentId = self.parentAgentId;
+	if (parentId === undefined && children.length === 0 && siblings.length === 0) return undefined;
 
 	const entry = (record: AgentRecord): string => {
 		const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
 		const orphan = isOrphanRecord(record, self, liveIds) ? "[orphan]" : "";
 		return `${record.id}:${statusShort(record.status)}${win}${orphan}`;
 	};
-	const parts = children.map((record) => theme.fg(statusColorRole(record.status), entry(record)));
-	if (siblings.length > 0) {
-		if (parts.length > 0) parts.push(theme.fg("dim", "|"));
-		parts.push(...siblings.map((record) => theme.fg("dim", entry(record))));
+	const groups: string[][] = [];
+	if (parentId !== undefined) {
+		const parent = agents.find((record) => record.id === parentId);
+		const label = theme.fg("muted", "parent:");
+		groups.push([
+			parent
+				? `${label}${theme.fg(statusColorRole(parent.status), entry(parent))}`
+				: `${label}${theme.fg("error", `${parentId}:gone`)}`,
+		]);
 	}
-	return parts.join(" ");
+	if (children.length > 0) {
+		groups.push(children.map((record) => theme.fg(statusColorRole(record.status), entry(record))));
+	}
+	if (siblings.length > 0) {
+		groups.push(siblings.map((record) => theme.fg("dim", entry(record))));
+	}
+	return groups.map((group) => group.join(" ")).join(` ${theme.fg("dim", "|")} `);
 }
 
 function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
