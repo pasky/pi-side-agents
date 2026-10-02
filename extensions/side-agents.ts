@@ -656,7 +656,18 @@ async function atomicWrite(path: string, content: string): Promise<void> {
 	await fs.rename(tmp, path);
 }
 
-type FileLockState = { raw: string; ino: number; mtimeMs: number; ageMs: number; pid?: number; token?: string };
+// Cross-process mutex on a lock file. Lock files are created atomically with
+// their full content (write temp + link(2), which fails with EEXIST if the lock
+// exists), so a lock never exists without its owner pid and token.
+//
+// Known limits (no OS-level locking in Node): a lock whose holder pid is dead
+// is broken under a `.break` side lock; if a breaker itself dies within the
+// milliseconds it holds that side lock, *and* several waiters then contend for
+// a dead main lock at once, two of them may still both enter. A finite staleMs
+// evicts even a live holder, which is only safe for very short critical
+// sections (the registry lock); the worktree allocation lock never does.
+
+type FileLockState = { raw: string; ageMs: number; pid?: number; token?: string };
 
 async function readFileLockState(lockPath: string): Promise<FileLockState | undefined> {
 	try {
@@ -669,63 +680,86 @@ async function readFileLockState(lockPath: string): Promise<FileLockState | unde
 			if (typeof data?.pid === "number") pid = data.pid;
 			if (typeof data?.token === "string") token = data.token;
 		} catch {
-			// empty/partial content: holder crashed between create and write, or is mid-write
+			// corrupt / legacy lock without metadata
 		}
-		return { raw, ino: st.ino, mtimeMs: st.mtimeMs, ageMs: Date.now() - st.mtimeMs, pid, token };
+		return { raw, ageMs: Date.now() - st.mtimeMs, pid, token };
 	} catch {
 		return undefined;
 	}
 }
 
+/** Atomically create `lockPath` holding `{pid, token}`; false if it already exists. */
+async function createLockFile(lockPath: string, token: string): Promise<boolean> {
+	const content = JSON.stringify({ pid: process.pid, token, createdAt: nowIso() }) + "\n";
+	const tmp = `${lockPath}.${token}.tmp`;
+	await fs.writeFile(tmp, content, "utf8");
+	try {
+		await fs.link(tmp, lockPath);
+		return true;
+	} catch (err: any) {
+		if (err?.code === "EEXIST") return false;
+		if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"].includes(err?.code)) throw err;
+		// Filesystem without hard links: fall back to O_EXCL create + write.
+		let handle: Awaited<ReturnType<typeof fs.open>>;
+		try {
+			handle = await fs.open(lockPath, "wx");
+		} catch (openErr: any) {
+			if (openErr?.code === "EEXIST") return false;
+			throw openErr;
+		}
+		try {
+			await handle.writeFile(content, "utf8");
+		} finally {
+			await handle.close().catch(() => {});
+		}
+		return true;
+	} finally {
+		await fs.unlink(tmp).catch(() => {});
+	}
+}
+
+/** Remove `lockPath` only if it still carries `token`. */
+async function removeOwnLockFile(lockPath: string, token: string): Promise<void> {
+	const current = await readFileLockState(lockPath);
+	if (current?.token === token) await fs.unlink(lockPath).catch(() => {});
+}
+
 function fileLockLooksStale(state: FileLockState, staleMs: number): boolean {
 	if (state.ageMs > staleMs) return true;
-	// Grace period: a fresh lock may not have its pid written yet.
-	if (state.ageMs <= 2_000) return false;
-	// Unreadable metadata: the holder writes it right after creating the file,
-	// so a long-unreadable lock is a crash leftover.
+	// Locks are created with their pid in place; a pid-less one is corrupt or
+	// from an older version. Give a possible live writer plenty of time.
 	if (state.pid === undefined) return state.ageMs > 60_000;
 	return !isPidAlive(state.pid);
 }
 
 /**
- * Remove `lockPath` if it is stale. Breaking is itself serialized through a
- * `.break` side lock, and the lock is re-read under it and only removed if it
- * is still the exact instance judged stale — otherwise two waiters that both
- * observed the same dead holder could each delete the lock and both enter.
+ * Remove `lockPath` if it is stale. Breaking is serialized through a `.break`
+ * side lock and the lock is re-read under it, so it is only removed if it is
+ * still the exact instance (by unique token/content) judged stale — otherwise
+ * two waiters that observed the same dead holder could each delete the lock
+ * (the second one deleting the first one's fresh lock) and both enter.
  */
 async function breakStaleFileLock(lockPath: string, staleMs: number): Promise<void> {
 	const observed = await readFileLockState(lockPath);
 	if (!observed || !fileLockLooksStale(observed, staleMs)) return;
 
 	const breakerPath = `${lockPath}.break`;
-	try {
-		// Breaking takes milliseconds; a breaker this old was left by a crash.
-		const st = await fs.stat(breakerPath);
-		if (Date.now() - st.mtimeMs > 10_000) await fs.unlink(breakerPath).catch(() => {});
-	} catch {
-		// no breaker
-	}
-
-	let breaker: Awaited<ReturnType<typeof fs.open>>;
-	try {
-		breaker = await fs.open(breakerPath, "wx");
-	} catch {
-		return; // someone else is breaking it
+	const breakerToken = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	if (!(await createLockFile(breakerPath, breakerToken))) {
+		// Someone else is breaking it — unless that breaker died mid-break.
+		const breaker = await readFileLockState(breakerPath);
+		if (breaker && fileLockLooksStale(breaker, Number.POSITIVE_INFINITY)) {
+			await fs.unlink(breakerPath).catch(() => {});
+		}
+		return;
 	}
 	try {
 		const current = await readFileLockState(lockPath);
-		if (
-			current &&
-			current.ino === observed.ino &&
-			current.mtimeMs === observed.mtimeMs &&
-			current.raw === observed.raw &&
-			fileLockLooksStale(current, staleMs)
-		) {
+		if (current && current.raw === observed.raw && fileLockLooksStale(current, staleMs)) {
 			await fs.unlink(lockPath).catch(() => {});
 		}
 	} finally {
-		await breaker.close().catch(() => {});
-		await fs.unlink(breakerPath).catch(() => {});
+		await removeOwnLockFile(breakerPath, breakerToken);
 	}
 }
 
@@ -735,7 +769,7 @@ async function withFileLock<T>(
 	options: {
 		/** How long to keep retrying before giving up. */
 		timeoutMs?: number;
-		/** Age after which a lock is broken even if its holder pid looks alive.
+		/** Age after which a lock is broken even if its holder pid is alive.
 		 * Infinity = never evict a live holder. */
 		staleMs?: number;
 	} = {},
@@ -748,33 +782,12 @@ async function withFileLock<T>(
 	// Acquire. Kept separate from running fn so errors thrown by fn (even ones
 	// with code EEXIST) are never mistaken for lock contention.
 	const started = Date.now();
-	let ino = -1;
-	while (true) {
-		let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-		try {
-			handle = await fs.open(lockPath, "wx");
-		} catch (err: any) {
-			if (err?.code !== "EEXIST") throw err;
-		}
-		if (handle) {
-			try {
-				ino = (await handle.stat()).ino;
-				await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: nowIso() }) + "\n", "utf8");
-			} catch {
-				// best effort; release falls back to the inode check
-			} finally {
-				await handle.close().catch(() => {});
-			}
-			break;
-		}
-
+	while (!(await createLockFile(lockPath, token))) {
 		await breakStaleFileLock(lockPath, staleMs);
 		if (Date.now() - started > timeoutMs) {
 			const holder = await readFileLockState(lockPath);
 			const holderInfo = holder?.pid !== undefined ? ` (held by pid ${holder.pid})` : "";
-			throw new Error(
-				`Timed out waiting for lock ${lockPath}${holderInfo}; remove it if no live process holds it`,
-			);
+			throw new Error(`Timed out waiting for lock ${lockPath}${holderInfo}; remove it if no live process holds it`);
 		}
 		await sleep(40 + Math.random() * 80);
 	}
@@ -782,12 +795,9 @@ async function withFileLock<T>(
 	try {
 		return await fn();
 	} finally {
-		// Release only our own lock: if it was (wrongly) broken and re-acquired by
-		// someone else meanwhile, deleting it would let a third party in.
-		const current = await readFileLockState(lockPath);
-		if (current && (current.token === token || (current.token === undefined && current.ino === ino))) {
-			await fs.unlink(lockPath).catch(() => {});
-		}
+		// Release only our own lock: if it was evicted (finite staleMs) and
+		// re-acquired meanwhile, deleting it would let a third party in.
+		await removeOwnLockFile(lockPath, token);
 	}
 }
 

@@ -13,7 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -198,4 +198,41 @@ test("withFileLock — release does not delete a lock now owned by someone else"
 		await writeFile(lockPath, JSON.stringify({ pid: process.pid, token: "other-owner" }) + "\n");
 	});
 	assert.match(await readFile(lockPath, "utf8"), /other-owner/);
+});
+
+test("withFileLock — release does not delete a metadata-less successor lock", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-side-lock-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const lockPath = join(dir, "z.lock");
+	await __testing.withFileLock(lockPath, async () => {
+		// Successor caught between create and write (possibly on a recycled inode).
+		await rm(lockPath);
+		await writeFile(lockPath, "");
+	});
+	assert.equal(await readFile(lockPath, "utf8"), "", "successor's lock must survive our release");
+});
+
+test("withFileLock — lock content is complete the moment the lock exists", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-side-lock-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const lockPath = join(dir, "c.lock");
+	await __testing.withFileLock(lockPath, async () => {
+		const data = JSON.parse(await readFile(lockPath, "utf8"));
+		assert.equal(data.pid, process.pid);
+		assert.equal(typeof data.token, "string");
+	});
+	assert.deepEqual((await readdir(dir)).sort(), [], "no lock or temp files left behind");
+});
+
+test("withFileLock — a breaker left behind by a dead process does not block recovery", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-side-lock-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const lockPath = join(dir, "b.lock");
+	await writeOldLock(lockPath, { pid: DEAD_PID, token: "dead" });
+	await writeOldLock(`${lockPath}.break`, { pid: DEAD_PID, token: "dead-breaker" });
+	let ran = false;
+	await __testing.withFileLock(lockPath, async () => {
+		ran = true;
+	}, { timeoutMs: 5_000, staleMs: Number.POSITIVE_INFINITY });
+	assert.equal(ran, true);
 });
