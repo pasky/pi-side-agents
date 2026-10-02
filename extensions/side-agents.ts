@@ -656,6 +656,79 @@ async function atomicWrite(path: string, content: string): Promise<void> {
 	await fs.rename(tmp, path);
 }
 
+type FileLockState = { raw: string; ino: number; mtimeMs: number; ageMs: number; pid?: number; token?: string };
+
+async function readFileLockState(lockPath: string): Promise<FileLockState | undefined> {
+	try {
+		const st = await fs.stat(lockPath);
+		const raw = await fs.readFile(lockPath, "utf8");
+		let pid: number | undefined;
+		let token: string | undefined;
+		try {
+			const data = JSON.parse(raw);
+			if (typeof data?.pid === "number") pid = data.pid;
+			if (typeof data?.token === "string") token = data.token;
+		} catch {
+			// empty/partial content: holder crashed between create and write, or is mid-write
+		}
+		return { raw, ino: st.ino, mtimeMs: st.mtimeMs, ageMs: Date.now() - st.mtimeMs, pid, token };
+	} catch {
+		return undefined;
+	}
+}
+
+function fileLockLooksStale(state: FileLockState, staleMs: number): boolean {
+	if (state.ageMs > staleMs) return true;
+	// Grace period: a fresh lock may not have its pid written yet.
+	if (state.ageMs <= 2_000) return false;
+	// Unreadable metadata: the holder writes it right after creating the file,
+	// so a long-unreadable lock is a crash leftover.
+	if (state.pid === undefined) return state.ageMs > 60_000;
+	return !isPidAlive(state.pid);
+}
+
+/**
+ * Remove `lockPath` if it is stale. Breaking is itself serialized through a
+ * `.break` side lock, and the lock is re-read under it and only removed if it
+ * is still the exact instance judged stale — otherwise two waiters that both
+ * observed the same dead holder could each delete the lock and both enter.
+ */
+async function breakStaleFileLock(lockPath: string, staleMs: number): Promise<void> {
+	const observed = await readFileLockState(lockPath);
+	if (!observed || !fileLockLooksStale(observed, staleMs)) return;
+
+	const breakerPath = `${lockPath}.break`;
+	try {
+		// Breaking takes milliseconds; a breaker this old was left by a crash.
+		const st = await fs.stat(breakerPath);
+		if (Date.now() - st.mtimeMs > 10_000) await fs.unlink(breakerPath).catch(() => {});
+	} catch {
+		// no breaker
+	}
+
+	let breaker: Awaited<ReturnType<typeof fs.open>>;
+	try {
+		breaker = await fs.open(breakerPath, "wx");
+	} catch {
+		return; // someone else is breaking it
+	}
+	try {
+		const current = await readFileLockState(lockPath);
+		if (
+			current &&
+			current.ino === observed.ino &&
+			current.mtimeMs === observed.mtimeMs &&
+			current.raw === observed.raw &&
+			fileLockLooksStale(current, staleMs)
+		) {
+			await fs.unlink(lockPath).catch(() => {});
+		}
+	} finally {
+		await breaker.close().catch(() => {});
+		await fs.unlink(breakerPath).catch(() => {});
+	}
+}
+
 async function withFileLock<T>(
 	lockPath: string,
 	fn: () => Promise<T>,
@@ -663,66 +736,57 @@ async function withFileLock<T>(
 		/** How long to keep retrying before giving up. */
 		timeoutMs?: number;
 		/** Age after which a lock is broken even if its holder pid looks alive.
-		 * Must comfortably exceed the longest legitimate critical section. */
+		 * Infinity = never evict a live holder. */
 		staleMs?: number;
 	} = {},
 ): Promise<T> {
 	const timeoutMs = options.timeoutMs ?? 10_000;
 	const staleMs = options.staleMs ?? 30_000;
+	const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 	await ensureDir(dirname(lockPath));
 
+	// Acquire. Kept separate from running fn so errors thrown by fn (even ones
+	// with code EEXIST) are never mistaken for lock contention.
 	const started = Date.now();
+	let ino = -1;
 	while (true) {
+		let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
 		try {
-			const handle = await fs.open(lockPath, "wx");
-			try {
-				await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: nowIso() }) + "\n", "utf8");
-			} catch {
-				// best effort
-			}
-
-			try {
-				return await fn();
-			} finally {
-				await handle.close().catch(() => {});
-				await fs.unlink(lockPath).catch(() => {});
-			}
+			handle = await fs.open(lockPath, "wx");
 		} catch (err: any) {
 			if (err?.code !== "EEXIST") throw err;
-
+		}
+		if (handle) {
 			try {
-				const st = await fs.stat(lockPath);
-				const ageMs = Date.now() - st.mtimeMs;
-				if (ageMs > staleMs) {
-					await fs.unlink(lockPath).catch(() => {});
-					continue;
-				}
-				// Check if the lock holder is still alive (stale lock after crash/reboot)
-				if (ageMs > 2_000) {
-					try {
-						const raw = await fs.readFile(lockPath, "utf8");
-						const data = JSON.parse(raw);
-						if (typeof data.pid === "number") {
-							try {
-								process.kill(data.pid, 0); // signal 0 = existence check
-							} catch {
-								// PID doesn't exist → stale lock
-								await fs.unlink(lockPath).catch(() => {});
-								continue;
-							}
-						}
-					} catch {
-						// If we can't read/parse the lock, fall through to normal timeout
-					}
-				}
+				ino = (await handle.stat()).ino;
+				await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: nowIso() }) + "\n", "utf8");
 			} catch {
-				// ignore
+				// best effort; release falls back to the inode check
+			} finally {
+				await handle.close().catch(() => {});
 			}
+			break;
+		}
 
-			if (Date.now() - started > timeoutMs) {
-				throw new Error(`Timed out waiting for lock ${lockPath}`);
-			}
-			await sleep(40 + Math.random() * 80);
+		await breakStaleFileLock(lockPath, staleMs);
+		if (Date.now() - started > timeoutMs) {
+			const holder = await readFileLockState(lockPath);
+			const holderInfo = holder?.pid !== undefined ? ` (held by pid ${holder.pid})` : "";
+			throw new Error(
+				`Timed out waiting for lock ${lockPath}${holderInfo}; remove it if no live process holds it`,
+			);
+		}
+		await sleep(40 + Math.random() * 80);
+	}
+
+	try {
+		return await fn();
+	} finally {
+		// Release only our own lock: if it was (wrongly) broken and re-acquired by
+		// someone else meanwhile, deleting it would let a third party in.
+		const current = await readFileLockState(lockPath);
+		if (current && (current.token === token || (current.token === undefined && current.ino === ino))) {
+			await fs.unlink(lockPath).catch(() => {});
 		}
 	}
 }
@@ -1127,12 +1191,12 @@ type AllocateWorktreeOptions = Parameters<typeof allocateWorktreeUnlocked>[0];
  * earlier one's (freshly created, hence "fully merged") branch. Serialize via a
  * cross-process file lock held from scan through lock write. Git checkouts can
  * be slow on big repos, so wait long and only break the lock if its holder pid
- * is dead (or after a generous age cap).
+ * is dead — a live (if slow) holder is never evicted.
  */
 async function allocateWorktree(options: AllocateWorktreeOptions): Promise<AllocateWorktreeResult> {
 	return withFileLock(getWorktreeAllocLockPath(options.stateRoot), () => allocateWorktreeUnlocked(options), {
 		timeoutMs: 10 * 60_000,
-		staleMs: 15 * 60_000,
+		staleMs: Number.POSITIVE_INFINITY,
 	});
 }
 
@@ -3911,4 +3975,4 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 }
 
 /** Internals exposed for unit tests only (Pi loads just the default export). */
-export const __testing = { allocateWorktree, allocateWorktreeUnlocked };
+export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock };
