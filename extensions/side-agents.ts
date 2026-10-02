@@ -572,6 +572,10 @@ function getRegistryLockPath(stateRoot: string): string {
 	return join(getMetaDir(stateRoot), "registry.lock");
 }
 
+function getWorktreeAllocLockPath(stateRoot: string): string {
+	return join(getMetaDir(stateRoot), "worktree-alloc.lock");
+}
+
 function getRuntimeDir(stateRoot: string, agentId: string): string {
 	return join(getMetaDir(stateRoot), "runtime", agentId);
 }
@@ -652,7 +656,19 @@ async function atomicWrite(path: string, content: string): Promise<void> {
 	await fs.rename(tmp, path);
 }
 
-async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+async function withFileLock<T>(
+	lockPath: string,
+	fn: () => Promise<T>,
+	options: {
+		/** How long to keep retrying before giving up. */
+		timeoutMs?: number;
+		/** Age after which a lock is broken even if its holder pid looks alive.
+		 * Must comfortably exceed the longest legitimate critical section. */
+		staleMs?: number;
+	} = {},
+): Promise<T> {
+	const timeoutMs = options.timeoutMs ?? 10_000;
+	const staleMs = options.staleMs ?? 30_000;
 	await ensureDir(dirname(lockPath));
 
 	const started = Date.now();
@@ -677,7 +693,7 @@ async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<
 			try {
 				const st = await fs.stat(lockPath);
 				const ageMs = Date.now() - st.mtimeMs;
-				if (ageMs > 30_000) {
+				if (ageMs > staleMs) {
 					await fs.unlink(lockPath).catch(() => {});
 					continue;
 				}
@@ -703,7 +719,7 @@ async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<
 				// ignore
 			}
 
-			if (Date.now() - started > 10_000) {
+			if (Date.now() - started > timeoutMs) {
 				throw new Error(`Timed out waiting for lock ${lockPath}`);
 			}
 			await sleep(40 + Math.random() * 80);
@@ -1101,7 +1117,26 @@ async function syncParallelAgentPiFiles(parentRepoRoot: string, worktreePath: st
 	}
 }
 
-async function allocateWorktree(options: {
+type AllocateWorktreeOptions = Parameters<typeof allocateWorktreeUnlocked>[0];
+
+/**
+ * Pick and claim a worktree slot. The free-slot scan and the claim (writing
+ * `.pi/active.lock`) must happen atomically: otherwise concurrent starts — e.g.
+ * parallel agent-start tool calls, or two sessions — each see the same slot as
+ * free and both check out their branch in it, the later one deleting the
+ * earlier one's (freshly created, hence "fully merged") branch. Serialize via a
+ * cross-process file lock held from scan through lock write. Git checkouts can
+ * be slow on big repos, so wait long and only break the lock if its holder pid
+ * is dead (or after a generous age cap).
+ */
+async function allocateWorktree(options: AllocateWorktreeOptions): Promise<AllocateWorktreeResult> {
+	return withFileLock(getWorktreeAllocLockPath(options.stateRoot), () => allocateWorktreeUnlocked(options), {
+		timeoutMs: 10 * 60_000,
+		staleMs: 15 * 60_000,
+	});
+}
+
+async function allocateWorktreeUnlocked(options: {
 	repoRoot: string;
 	stateRoot: string;
 	agentId: string;
@@ -3874,3 +3909,6 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		await renderStatusLine(pi, ctx, { emitTransitions: false }).catch(() => {});
 	});
 }
+
+/** Internals exposed for unit tests only (Pi loads just the default export). */
+export const __testing = { allocateWorktree, allocateWorktreeUnlocked };
