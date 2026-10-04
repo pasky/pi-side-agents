@@ -3411,8 +3411,14 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 /**
  * Status line scope: for a nested agent (parent is another side agent, not
  * main) a `parent:` entry first, so it is clear whose subtree this session
- * lives in; then the session's own children, then (muted) its siblings —
- * groups separated by `|`. Main has no parent/siblings and sees exactly its
+ * lives in; then the session's own children, then its siblings — groups
+ * separated by `|`.
+ *
+ * UX purpose: the status line is a quick-travel map for hopping across side
+ * agents one by one (`@N` = tmux window to switch to). Every entry —
+ * parent, children AND siblings — is therefore colored by its status, so you
+ * can spot from any window which neighbour needs you next. Do not mute
+ * siblings or otherwise drop status colors. Main has no parent/siblings and sees exactly its
  * direct children plus orphans; a leaf grandchild sees its parent and
  * siblings. Returns undefined when there is nothing to show.
  */
@@ -3450,7 +3456,7 @@ function formatStatusLine(
 		groups.push(children.map((record) => theme.fg(statusColorRole(record.status), entry(record))));
 	}
 	if (siblings.length > 0) {
-		groups.push(siblings.map((record) => theme.fg("dim", entry(record))));
+		groups.push(siblings.map((record) => theme.fg(statusColorRole(record.status), entry(record))));
 	}
 	return groups.map((group) => group.join(" ")).join(` ${theme.fg("dim", "|")} `);
 }
@@ -3985,4 +3991,4 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 }
 
 /** Internals exposed for unit tests only (Pi loads just the default export). */
-export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock };
+export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock, formatStatusLine };

@@ -18,7 +18,7 @@ The most advanced users of AI coding agents have worked like this for a while, b
 ## What it does
 
 - New command `/agent [-model ...] <task>` to spawn a background child Pi agent.
-- Shows active-agent summary with tmux window numbers in the statusline.
+- Shows active-agent summary with tmux window numbers in the statusline, color-coded by status — a quick-travel map for hopping across side agents one by one (nested agents also see their parent and siblings there).
 - New command `/agents` to inspect current agents and clean up stale state.
 - New command `/agent-resume` to pick a previously `/quit` side-agent session and reopen it (conversation + branch) in a worktree/tmux window.
 - New skill `agent-setup` to scaffold project-specific lifecycle scripts (flexible worktree initialization and merge process).
