@@ -1,0 +1,66 @@
+#!/bin/bash
+# Fast per-keystroke helper for tmux-switch (called by fzf; python startup is too slow here).
+#   tmux-switch-action <kind> <metafile>     kind: digits | esc | next-group | prev-group
+#   tmux-switch-action preview <session> <window-index>
+# metafile: one line per list entry, "h <idx>" (project header) or "w <idx>" (window).
+NORMAL_PROMPT="# "
+SEARCH_PROMPT="/ "
+NORMAL_KEYS="j,k,g,G,l,q,J,K,/"
+
+kind=$1
+
+if [ "$kind" = preview ]; then
+	# visible pane content minus trailing blank lines, bottom part that fits
+	tmux capture-pane -e -p -J -t "$2:$3" |
+		awk '{ l[NR] = $0 } END { n = NR; while (n > 0) { s = l[n]; gsub(/\033\[[0-9;]*m|[ \t]/, "", s); if (s != "") break; n-- } for (i = 1; i <= n; i++) print l[i] }' |
+		tail -n "${FZF_PREVIEW_LINES:-40}"
+	exit 0
+fi
+
+meta=$2
+pos=${FZF_POS:-1}
+
+case "$kind" in
+esc)
+	if [ "$FZF_PROMPT" = "$SEARCH_PROMPT" ]; then
+		echo "disable-search+clear-query+change-prompt($NORMAL_PROMPT)+rebind($NORMAL_KEYS)"
+	else
+		echo abort
+	fi
+	;;
+next-group | prev-group)
+	awk -v pos="$pos" -v kind="$kind" '
+		$1 == "h" { h[++nh] = NR } END {
+			cur = 1; for (i = 1; i <= nh; i++) if (h[i] <= pos) cur = i
+			t = cur
+			if (kind == "next-group" && cur < nh) t = cur + 1
+			if (kind == "prev-group" && cur > 1) t = cur - 1
+			p = h[t] + 1; if (p > NR) p = NR
+			printf "pos(%d)", p
+		}' "$meta"
+	;;
+digits)
+	[ "$FZF_PROMPT" = "$NORMAL_PROMPT" ] || exit 0
+	q=$FZF_QUERY
+	[ -n "$q" ] || exit 0
+	case "$q" in *[!0-9]*) echo clear-query; exit 0 ;; esac
+	awk -v q="$q" '
+		$1 == "w" { idx[NR] = $2 } END {
+			# does any window number start with q? else restart from the last digit
+			for (n in idx) if (index(idx[n], q) == 1) found = 1
+			if (!found) {
+				q1 = substr(q, length(q))
+				for (n in idx) if (index(idx[n], q1) == 1) { printf "change-query(%s)", q1; exit }
+				printf "clear-query"; exit
+			}
+			exact = 0; longer = 0; first = 0
+			for (n in idx) {
+				if (idx[n] == q) exact = n
+				else if (index(idx[n], q) == 1) longer = 1
+				if (index(idx[n], q) == 1 && (first == 0 || n + 0 < first)) first = n + 0
+			}
+			if (exact) printf "pos(%d)%s", exact, (longer ? "" : "+accept")
+			else printf "pos(%d)", first
+		}' "$meta"
+	;;
+esac

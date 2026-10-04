@@ -1,0 +1,12 @@
+#!/bin/sh
+# tmux session-window-changed hook helper (see README.md): a pi agent window
+# that is "done" (finished, unseen) becomes "idle" once you visit it, or when you
+# leave it after it finished while you were looking at it.
+s="$1"
+[ -n "$s" ] || exit 0
+tmux list-windows -t "$s" -F '#{window_index} #{window_active} #{window_last_flag} #{@agent_state}' |
+while read -r idx active last state; do
+	if [ "$state" = done ] && { [ "$active" = 1 ] || [ "$last" = 1 ]; }; then
+		tmux set-option -w -t "$s:$idx" @agent_state idle
+	fi
+done

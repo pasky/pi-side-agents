@@ -1,0 +1,236 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""tmux window switcher: windows grouped by project, coloured by pi agent state.
+
+Usage (from tmux.conf; see README.md next to this script):
+  bind '"' display-popup -B -E -w 100% -h 100% "~/bin/tmux-switch '#{session_name}'"
+Requires fzf and uv; tmux-switch-action must sit in the same directory.
+
+Keys (normal mode, prompt '# '):
+  j/k  move     J/K  next/prev project     g/G  top/bottom     C-d/C-u  half page
+  l/Enter  switch     q/Esc  quit     C-/  toggle preview
+  digits   jump to that window number (switches at once when unambiguous)
+  /        search mode (prompt '/ '): type to filter; Esc back to normal mode
+
+Agent state comes from window options @agent_state / @agent_since, which are
+set by the tmux-agent-state.ts pi extension (shipped alongside this script).
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+SEP = "<|>"
+DELETED = " (deleted)"
+WORKTREE_RE = re.compile(r"-agent-worktree-(\d+)$")
+
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+RED = "\x1b[31m"
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+CYAN = "\x1b[36m"
+GREY = "\x1b[90m"
+
+
+def tmux(*args: str) -> str:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout
+
+
+def project_root(path: str) -> str:
+    """Repo top level for path, folding pi-side-agents worktrees (<repo>-agent-worktree-N) into <repo>."""
+    try:
+        top = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except Exception:
+        top = ""
+    top = top or path
+    m = WORKTREE_RE.search(top)
+    return top[: m.start()] if m else top
+
+
+def pretty_path(path: str) -> str:
+    for base in (HOME + "/projects/", HOME + "/src/"):
+        if path.startswith(base):
+            return path[len(base):] if base.endswith("/projects/") else "src/" + path[len(base):]
+    if path == HOME:
+        return "~"
+    if path.startswith(HOME + "/"):
+        return "~/" + path[len(HOME) + 1:]
+    return path
+
+
+def pi_summary(title: str) -> str:
+    """pi sets the terminal title to 'π - <session summary> - <dir>'; extract the summary."""
+    if not title.startswith("π - "):
+        return ""
+    parts = title[len("π - "):].rsplit(" - ", 1)
+    return parts[0] if len(parts) == 2 else ""
+
+
+def age(since: str) -> str:
+    try:
+        s = max(0, int(time.time()) - int(since))
+    except ValueError:
+        return ""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def state_cell(state: str, since: str, bell: bool) -> tuple[str, int]:
+    """(coloured cell, rank) — rank used for group summary."""
+    a = age(since)
+    if state == "working":
+        cell = f"{YELLOW}● working {a:>3}{RESET}"
+    elif state == "done":
+        cell = f"{BOLD}{GREEN}✔ done    {a:>3}{RESET}"
+    elif state == "idle":
+        cell = f"{DIM}○ idle    {a:>3}{RESET}"
+    else:
+        cell = f"{GREY}·{' ' * 12}{RESET}"
+    if bell and not state:
+        cell = f"{RED}! bell{' ' * 7}{RESET}"
+    return cell, {"done": 0, "working": 1, "idle": 2}.get(state, 3)
+
+
+def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
+    fmt = SEP.join([
+        "#{window_index}", "#{window_name}", "#{window_active}", "#{pane_current_command}",
+        "#{pane_current_path}", "#{@agent_state}", "#{@agent_since}", "#{window_bell_flag}", "#{pane_title}",
+    ])
+    rows = [l.split(SEP) for l in tmux("list-windows", "-t", session, "-F", fmt).split("\n") if l]
+    # tmux appends " (deleted)" when the pane's cwd was removed (e.g. a finished side-agent worktree)
+    gone = set()
+    for r in rows:
+        if r[4].endswith(DELETED):
+            r[4] = r[4][: -len(DELETED)]
+            gone.add(r[0])
+    paths = sorted({r[4] for r in rows})
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        roots = dict(zip(paths, ex.map(project_root, paths)))
+
+    groups: dict[str, list] = {}
+    for idx, name, active, cmd, path, state, since, bell, title in rows:
+        root = roots[path]
+        groups.setdefault(root, []).append((int(idx), name, active == "1", cmd, path, state, since, bell == "1", title))
+
+    def gkey(root: str):
+        return (root != HOME, pretty_path(root).lower())
+
+    lines: list[str] = []
+    meta: list[tuple[str, int]] = []  # per line: ("h", first window idx) or ("w", window idx)
+    cur_pos = 1
+    for root in sorted(groups, key=gkey):
+        wins = sorted(groups[root])
+        proj = pretty_path(root)
+        counts = {s: sum(1 for w in wins if w[5] == s) for s in ("working", "done")}
+        summary = "".join([
+            f"  {BOLD}{GREEN}✔{counts['done']}{RESET}" if counts["done"] else "",
+            f"  {YELLOW}●{counts['working']}{RESET}" if counts["working"] else "",
+        ])
+        lines.append(f"{wins[0][0]}\t{BOLD}{CYAN}{proj}{RESET}{summary}")
+        meta.append(("h", wins[0][0]))
+        for idx, name, active, cmd, path, state, since, bell, title in wins:
+            cell, _ = state_cell(state, since, bell)
+            label = name
+            if cmd and cmd != name and cmd not in ("bash", "zsh", "sh", "node") and not state:
+                label += f" {GREY}[{cmd}]{RESET}"
+            m = WORKTREE_RE.search(path)
+            if m:
+                label += f" {GREY}⎇{int(m.group(1))}{RESET}"
+            if str(idx) in gone:
+                label += f" {RED}(dir gone){RESET}"
+            sub = pretty_path(path)
+            if path != root and not m:
+                label += f" {GREY}{sub}{RESET}"
+            summary = pi_summary(title)
+            if summary:
+                label += f"  {GREY}{summary}{RESET}"
+            mark = f"{BOLD}*{RESET}" if active else " "
+            lines.append(f"{idx}\t  {idx:>2}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
+            meta.append(("w", idx))
+            if active:
+                cur_pos = len(lines)
+    return lines, cur_pos, meta
+
+
+def preview(session: str, idx: str) -> None:
+    rows = int(os.environ.get("FZF_PREVIEW_LINES", "40"))
+    out = tmux("capture-pane", "-e", "-p", "-J", "-t", f"{session}:{idx}").rstrip("\n").split("\n")
+    while out and not re.sub(r"\x1b\[[0-9;]*m", "", out[-1]).strip():
+        out.pop()
+    sys.stdout.write("\n".join(out[-rows:]) + "\n")
+
+
+def preview_window(n_lines: int) -> str:
+    """Give the preview whatever rows the full list leaves free; hide it if that's too little."""
+    try:
+        rows = os.get_terminal_size(sys.stderr.fileno()).lines
+    except OSError:
+        rows = 50
+    free = rows - n_lines - 3  # prompt line, preview border, slack
+    if free >= 10:
+        return f"down,{free},border-top"
+    return "down,50%,border-top,hidden"
+
+
+NORMAL_PROMPT = "# "   # normal mode: j/k navigate, digits jump to window number (see tmux-switch-action)
+SEARCH_PROMPT = "/ "   # search mode: type to filter
+NORMAL_KEYS = "j,k,g,G,l,q,J,K,/"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args and args[0] == "--preview":
+        preview(args[1], args[2])
+        return
+    session = args[0] if args and "#{" not in args[0] else tmux("display-message", "-p", "#{session_name}").strip()
+    lines, cur_pos, meta = build(session)
+    me = os.path.abspath(sys.argv[0])
+    q = lambda s: "'" + s.replace("'", "'\\''") + "'"
+    helper = os.path.join(os.path.dirname(me), "tmux-switch-action")
+    fd, cache = tempfile.mkstemp(prefix="tmux-switch-", suffix=".meta")
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(f"{k} {i}\n" for k, i in meta))
+    act = lambda kind: f"transform({q(helper)} {kind} {q(cache)})"
+    try:
+        fzf = subprocess.run(
+            [
+                "fzf", "--ansi", "--no-sort", "--layout=reverse", "--delimiter=\t", "--with-nth=2",
+                "--info=inline-right", f"--prompt={NORMAL_PROMPT}", "--pointer=▶", "--gutter= ", "--cycle",
+                "--disabled",
+                f"--bind=load:pos({cur_pos})",
+                "--bind=j:down,k:up,g:first,G:last,l:accept,q:abort,ctrl-d:half-page-down,ctrl-u:half-page-up",
+                f"--bind=J:{act('next-group')},K:{act('prev-group')}",
+                f"--bind=/:unbind({NORMAL_KEYS})+enable-search+clear-query+change-prompt({SEARCH_PROMPT})",
+                f"--bind=esc:{act('esc')}",
+                f"--bind=change:{act('digits')}",
+                f"--preview={q(helper)} preview {q(session)} {{1}}",
+                f"--preview-window={preview_window(len(lines))}", "--bind=ctrl-/:toggle-preview",
+            ],
+            input="\n".join(lines) + "\n", stdout=subprocess.PIPE, text=True,
+        )
+    finally:
+        os.unlink(cache)
+    choice = fzf.stdout.strip()
+    if fzf.returncode == 0 and choice:
+        tmux("select-window", "-t", f"{session}:{choice.split(chr(9), 1)[0]}")
+
+
+if __name__ == "__main__":
+    main()

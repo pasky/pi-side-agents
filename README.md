@@ -70,6 +70,10 @@ This registers the extension and skill with Pi. Restart Pi after installing.
 - Git repository (worktrees enabled)
 - Pi configured/authenticated
 
+## Extras
+
+- [`contrib/tmux-switch/`](contrib/tmux-switch/): a tmux window-switcher popup that groups windows by project and shows which agents are working, done (not yet looked at), or idle. It makes it quick to jump between many side agents. Opt-in; see its README for setup.
+
 ## Development
 
 Run tests:
