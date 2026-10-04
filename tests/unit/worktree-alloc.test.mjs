@@ -236,24 +236,3 @@ test("withFileLock — a breaker left behind by a dead process does not block re
 	}, { timeoutMs: 5_000, staleMs: Number.POSITIVE_INFINITY });
 	assert.equal(ran, true);
 });
-
-test("status line: parent, children and siblings are all colored by status (quick-travel UX)", () => {
-	const theme = { fg: (role, text) => `<${role}>${text}</${role}>` };
-	const agents = [
-		{ id: "a", status: "running", tmuxWindowIndex: 1 },
-		{ id: "b", status: "crashed", tmuxWindowIndex: 2 },
-		{ id: "a1", parentAgentId: "a", depth: 2, status: "running", tmuxWindowIndex: 3 },
-		{ id: "a2", parentAgentId: "a", depth: 2, status: "waiting_user", tmuxWindowIndex: 4 },
-		{ id: "a3", parentAgentId: "a", depth: 2, status: "failed", tmuxWindowIndex: 5 },
-	];
-	// depth-1 agent "a": own children colored, sibling "b" colored by its status (not dimmed).
-	const lineA = __testing.formatStatusLine(agents, { selfId: "a", depth: 1 }, theme);
-	assert.match(lineA, /<accent>a2:wait@4<\/accent>/);
-	assert.match(lineA, /<error>b:crash@2<\/error>/);
-	// leaf "a1": parent colored, siblings colored by status.
-	const lineA1 = __testing.formatStatusLine(agents, { selfId: "a1", parentAgentId: "a", depth: 2 }, theme);
-	assert.match(lineA1, /<muted>parent:<\/muted><muted>a:run@1<\/muted>/);
-	assert.match(lineA1, /<accent>a2:wait@4<\/accent>/);
-	assert.match(lineA1, /<error>a3:fail@5<\/error>/);
-	assert.doesNotMatch(lineA1.replace(/<dim>\|<\/dim>/g, ""), /<dim>/);
-});

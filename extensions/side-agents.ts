@@ -3415,10 +3415,10 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
  * separated by `|`.
  *
  * UX purpose: the status line is a quick-travel map for hopping across side
- * agents one by one (`@N` = tmux window to switch to). Every entry —
- * parent, children AND siblings — is therefore colored by its status, so you
- * can spot from any window which neighbour needs you next. Do not mute
- * siblings or otherwise drop status colors. Main has no parent/siblings and sees exactly its
+ * agents one by one (`@N` = tmux window to switch to). Every entry — parent,
+ * children AND siblings — is therefore colored by its status, so you can spot
+ * from any window which neighbour needs you next. Do not unconditionally dim
+ * any group or otherwise drop status colors. Main has no parent/siblings and sees exactly its
  * direct children plus orphans; a leaf grandchild sees its parent and
  * siblings. Returns undefined when there is nothing to show.
  */

@@ -40,7 +40,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test:unit": "node --test tests/unit/tool-contract.test.mjs tests/unit/worktree-alloc.test.mjs",
+    "test:unit": "node --test tests/unit/tool-contract.test.mjs tests/unit/worktree-alloc.test.mjs tests/unit/status-line.test.mjs",
     "test:integration": "node --test --test-concurrency=1 tests/integration/side-agents.integration.test.mjs"
   },
   "peerDependencies": {
