@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 HOME = os.path.expanduser("~")
 SEP = "<|>"
@@ -131,40 +132,73 @@ def load_registry(root: str) -> dict[str, tuple[str, str]]:
     return out
 
 
-def tree_order(wins: list[tuple]) -> list[tuple[tuple, str, bool, bool]]:
-    """Order a project's windows as a tree: nested side agents right below their parent agent.
+@dataclass
+class Win:
+    idx: int
+    wid: str
+    name: str
+    active: bool
+    cmd: str
+    path: str
+    state: str
+    since: str
+    bell: bool
+    title: str
+    gone: bool
+    agent_id: str = ""      # pi-side-agents agent id ("" = not a side agent / unknown)
+    parent_agent: str = ""  # agent id of the spawning side agent ("" = spawned by a main session)
+    parent_win: str = ""    # tmux window id of the spawning session, when tagged
 
-    Returns (window, tree prefix, nested, orphan) in display order. Windows whose parent
-    agent has no window (main sessions, top-level agents, orphans) are roots, in index order.
+
+def tree_order(wins: list[Win], root: str) -> list[tuple[Win, str, int, bool]]:
+    """Order a project's windows as a tree: side agents right below the window that spawned them.
+
+    Returns (window, tree prefix, level, orphan) in display order. The parent is the tagged
+    spawning window, else the window of the parent agent; windows of agents launched by an older
+    pi-side-agents (no tag, spawned by a main session) go under the project's main pi window
+    when there is exactly one. Windows without a parent here are roots, in index order.
     """
-    by_agent = {w[9]: w for w in wins if w[9]}
-    children: dict[int, list] = {}
-    roots = []
+    by_wid = {w.wid: w for w in wins}
+    by_agent = {w.agent_id: w for w in wins if w.agent_id}
+    mains = [w for w in wins if w.path == root and not w.agent_id and (w.state or w.cmd == "pi" or w.title.startswith("π"))]
+    parent_of: dict[str, Win] = {}
+    orphans: set[str] = set()
     for w in wins:
-        parent = by_agent.get(w[10]) if w[10] else None
-        if parent is not None and parent is not w:
-            children.setdefault(parent[0], []).append(w)
-        else:
-            roots.append(w)
-    out = []
-    seen: set[int] = set()
+        p = by_wid.get(w.parent_win) if w.parent_win else None
+        if p is None and w.parent_agent:
+            p = by_agent.get(w.parent_agent)
+            if p is None:
+                orphans.add(w.wid)
+        # untagged, or orphaned (adopted by the main session): under the sole main pi window, if any
+        if p is None and (w.wid in orphans or not w.parent_win) and len(mains) == 1:
+            if w.agent_id or WORKTREE_RE.search(w.path):
+                p = mains[0]
+        if p is not None and p is not w:
+            parent_of[w.wid] = p
+    children: dict[str, list[Win]] = {}
+    for w in wins:
+        if w.wid in parent_of:
+            children.setdefault(parent_of[w.wid].wid, []).append(w)
 
-    def walk(w: tuple, prefix: str, glyph: str, nested: bool) -> None:
-        if w[0] in seen:  # paranoia against parent cycles
+    out: list[tuple[Win, str, int, bool]] = []
+    seen: set[str] = set()
+
+    def walk(w: Win, cont: str, glyph: str, level: int) -> None:
+        if w.wid in seen:  # paranoia against parent cycles
             return
-        seen.add(w[0])
-        out.append((w, prefix + glyph, nested, bool(w[10]) and not nested))
-        kids = children.get(w[0], [])
+        seen.add(w.wid)
+        out.append((w, cont + glyph, level, w.wid in orphans))
+        kids = children.get(w.wid, [])
+        sub = cont + ("" if level == 0 else "  " if glyph == "└ " else "│ ")
         for i, k in enumerate(kids):
-            last = i == len(kids) - 1
-            cont = prefix + ("  " if glyph in ("", "└ ") else "│ ") if nested else ""
-            walk(k, cont, "└ " if last else "├ ", True)
+            walk(k, sub, "└ " if i == len(kids) - 1 else "├ ", level + 1)
 
-    for w in roots:
-        walk(w, "", "", False)
-    for w in wins:  # anything left over (cycles) still gets listed
-        if w[0] not in seen:
-            walk(w, "", "", False)
+    for w in wins:
+        if w.wid not in parent_of:
+            walk(w, "", "", 0)
+    for w in wins:  # anything left over (parent cycles) still gets listed
+        if w.wid not in seen:
+            walk(w, "", "", 0)
     return out
 
 
@@ -172,28 +206,31 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
     fmt = SEP.join([
         "#{window_index}", "#{window_name}", "#{window_active}", "#{pane_current_command}",
         "#{pane_current_path}", "#{@agent_state}", "#{@agent_since}", "#{window_bell_flag}", "#{pane_title}",
-        "#{window_id}", "#{@side_agent_id}", "#{@side_agent_parent}",
+        "#{window_id}", "#{@side_agent_id}", "#{@side_agent_parent}", "#{@side_agent_parent_window}",
     ])
-    rows = [l.split(SEP) for l in tmux("list-windows", "-t", session, "-F", fmt).split("\n") if l]
-    # tmux appends " (deleted)" when the pane's cwd was removed (e.g. a finished side-agent worktree)
-    gone = set()
-    for r in rows:
-        if r[4].endswith(DELETED):
-            r[4] = r[4][: -len(DELETED)]
-            gone.add(r[0])
-    paths = sorted({r[4] for r in rows})
+    wins: list[Win] = []
+    for l in tmux("list-windows", "-t", session, "-F", fmt).split("\n"):
+        r = l.split(SEP)
+        if len(r) != 13:
+            continue
+        idx, name, active, cmd, path, state, since, bell, title, wid, agent_id, parent_agent, parent_win = r
+        # tmux appends " (deleted)" when the pane's cwd was removed (e.g. a finished side-agent worktree)
+        gone = path.endswith(DELETED)
+        if gone:
+            path = path[: -len(DELETED)]
+        wins.append(Win(int(idx), wid, name, active == "1", cmd, path, state, since, bell == "1", title, gone,
+                        agent_id, parent_agent, parent_win))
+    paths = sorted({w.path for w in wins})
     with ThreadPoolExecutor(max_workers=16) as ex:
         roots = dict(zip(paths, ex.map(project_root, paths)))
     registries = {root: load_registry(root) for root in set(roots.values())}
 
-    groups: dict[str, list] = {}
-    for idx, name, active, cmd, path, state, since, bell, title, wid, agent_id, parent_id in rows:
-        root = roots[path]
-        if not agent_id:  # window not tagged by pi-side-agents (older version): fall back to its registry
-            agent_id, parent_id = registries[root].get(wid, ("", ""))
-        groups.setdefault(root, []).append(
-            (int(idx), name, active == "1", cmd, path, state, since, bell == "1", title, agent_id, parent_id)
-        )
+    groups: dict[str, list[Win]] = {}
+    for w in wins:
+        root = roots[w.path]
+        if not w.agent_id:  # window not tagged by pi-side-agents (older version): fall back to its registry
+            w.agent_id, w.parent_agent = registries[root].get(w.wid, ("", ""))
+        groups.setdefault(root, []).append(w)
 
     def gkey(root: str):
         return (root != HOME, pretty_path(root).lower())
@@ -202,46 +239,44 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
     meta: list[tuple[str, int]] = []  # per line: ("h", first window idx) or ("w", window idx)
     cur_pos = 1
     for root in sorted(groups, key=gkey):
-        ordered = tree_order(sorted(groups[root]))
+        ordered = tree_order(sorted(groups[root], key=lambda w: w.idx), root)
         proj = pretty_path(root)
-        # nested agents report to their parent agent, not to you: they don't count here
-        counts = {s: sum(1 for w, _, nested, _ in ordered if w[5] == s and not nested) for s in ("working", "done")}
+        # agents spawned by other agents report to their parent agent, not to you: dimmed, not counted
+        counts = {s: sum(1 for w, _, level, _ in ordered if w.state == s and level < 2) for s in ("working", "done")}
         summary = "".join([
             f"  {BOLD}{GREEN}✔{counts['done']}{RESET}" if counts["done"] else "",
             f"  {YELLOW}●{counts['working']}{RESET}" if counts["working"] else "",
         ])
-        first = ordered[0][0][0]
+        first = ordered[0][0].idx
         lines.append(f"{first}\t{BOLD}{CYAN}{proj}{RESET}{summary}")
         meta.append(("h", first))
-        for w, tree, nested, orphan in ordered:
-            idx, name, active, cmd, path, state, since, bell, title, agent_id, parent_id = w
-            if nested:
-                # dimmed so a finished grandchild doesn't look like something waiting for you
-                cell = f"{GREY}{state_glyph(state, since)}{RESET}"
+        for w, tree, level, orphan in ordered:
+            dim = level >= 2
+            if dim:
+                cell = f"{GREY}{state_glyph(w.state, w.since)}{RESET}"
             else:
-                cell, _ = state_cell(state, since, bell)
-            label = name
-            if cmd and cmd != name and cmd not in ("bash", "zsh", "sh", "node") and not state:
-                label += f" {GREY}[{cmd}]{RESET}"
-            m = WORKTREE_RE.search(path)
+                cell, _ = state_cell(w.state, w.since, w.bell)
+            label = w.name
+            if w.cmd and w.cmd != w.name and w.cmd not in ("bash", "zsh", "sh", "node") and not w.state:
+                label += f" {GREY}[{w.cmd}]{RESET}"
+            m = WORKTREE_RE.search(w.path)
             if m:
                 label += f" {GREY}⎇{int(m.group(1))}{RESET}"
-            if str(idx) in gone:
+            if w.gone:
                 label += f" {RED}(dir gone){RESET}"
             if orphan:
-                label += f" {GREY}(parent {parent_id} gone){RESET}"
-            sub = pretty_path(path)
-            if path != root and not m:
-                label += f" {GREY}{sub}{RESET}"
-            summary = pi_summary(title)
+                label += f" {GREY}(parent {w.parent_agent} gone){RESET}"
+            if w.path != root and not m:
+                label += f" {GREY}{pretty_path(w.path)}{RESET}"
+            summary = pi_summary(w.title)
             if summary:
                 label += f"  {GREY}{summary}{RESET}"
-            if nested:
-                label = f"{GREY}{tree}{re.sub(ANSI_RE, '', label)}{RESET}"
-            mark = f"{BOLD}*{RESET}" if active else " "
-            lines.append(f"{idx}\t  {idx:>2}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
-            meta.append(("w", idx))
-            if active:
+            if dim:
+                label = f"{GREY}{re.sub(ANSI_RE, '', label)}{RESET}"
+            mark = f"{BOLD}*{RESET}" if w.active else " "
+            lines.append(f"{w.idx}\t  {w.idx:>2}{mark} {cell}  {GREY}{tree}{RESET}{label}  {DIM}{GREY}· {proj}{RESET}")
+            meta.append(("w", w.idx))
+            if w.active:
                 cur_pos = len(lines)
     return lines, cur_pos, meta
 

@@ -1649,7 +1649,12 @@ function createTmuxWindow(tmuxSession: string, name: string): { windowId: string
  * Best effort: failures are ignored.
  */
 function tmuxTagAgentWindow(windowId: string, agentId: string, parentAgentId: string | undefined, depth: number): void {
+	// The spawning session's own window (main session or parent agent).
+	const pane = process.env.TMUX_PANE;
+	const parentWindow = pane ? run("tmux", ["display-message", "-p", "-t", pane, "#{window_id}"]) : undefined;
+	const parentWindowId = parentWindow?.ok ? parentWindow.stdout.trim() : "";
 	run("tmux", [
+		"set-option", "-w", "-t", windowId, "@side_agent_parent_window", parentWindowId, ";",
 		"set-option", "-w", "-t", windowId, "@side_agent_id", agentId, ";",
 		"set-option", "-w", "-t", windowId, "@side_agent_parent", parentAgentId ?? "", ";",
 		"set-option", "-w", "-t", windowId, "@side_agent_depth", String(depth),
