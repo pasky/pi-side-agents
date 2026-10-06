@@ -4,6 +4,7 @@ With several side agents running, it's hard to know which tmux window to visit n
 
 - groups windows by project, folding `<repo>-agent-worktree-N` side-agent worktrees into their repo (shown as `⎇N`)
 - colors each pi window by agent state: `● working`, **`✔ done`** (finished, not yet looked at), `○ idle`, with time since the last change
+- lays out nested side agents (spawned by another side agent) as a tree under their parent agent, dimmed and left out of the project counts. They report to their parent, not to you, so a finished grandchild doesn't look like it's waiting for you. The parent is read from the `@side_agent_id`/`@side_agent_parent` window options that pi-side-agents sets on agent windows, or from the project's `.pi/side-agents/registry.json` for windows created before those options existed
 - shows the pi session summary, a live pane preview, and per-project `✔`/`●` counts
 
 Keys: `j/k` move, `J/K` next/prev project, `g/G` top/bottom, `C-d/C-u` half page, `l`/`Enter` switch, digits jump to a window number, `/` search, `C-/` toggle preview, `q`/`Esc` quit.

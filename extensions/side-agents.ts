@@ -1643,6 +1643,19 @@ function createTmuxWindow(tmuxSession: string, name: string): { windowId: string
 	return { windowId, windowIndex };
 }
 
+/**
+ * Tag an agent window with its identity and parent (tmux window user options), so
+ * external tools like contrib/tmux-switch can show nested agents as a tree.
+ * Best effort: failures are ignored.
+ */
+function tmuxTagAgentWindow(windowId: string, agentId: string, parentAgentId: string | undefined, depth: number): void {
+	run("tmux", [
+		"set-option", "-w", "-t", windowId, "@side_agent_id", agentId, ";",
+		"set-option", "-w", "-t", windowId, "@side_agent_parent", parentAgentId ?? "", ";",
+		"set-option", "-w", "-t", windowId, "@side_agent_depth", String(depth),
+	]);
+}
+
 function tmuxWindowExists(windowId: string): boolean {
 	const result = run("tmux", ["display-message", "-p", "-t", windowId, "#{window_id}"]);
 	return result.ok && result.stdout.trim() === windowId;
@@ -2618,6 +2631,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		const tmuxSession = getCurrentTmuxSession();
 		const { windowId, windowIndex } = createTmuxWindow(tmuxSession, `agent-${agentId}`);
 		spawnedWindowId = windowId;
+		tmuxTagAgentWindow(windowId, agentId, self.selfId, depth);
 
 		await updateWorktreeLock(worktree.worktreePath, {
 			tmuxWindowId: windowId,

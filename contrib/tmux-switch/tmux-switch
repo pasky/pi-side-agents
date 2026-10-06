@@ -18,6 +18,7 @@ Agent state comes from window options @agent_state / @agent_since, which are
 set by the tmux-agent-state.ts pi extension (shipped alongside this script).
 """
 
+import json
 import os
 import re
 import subprocess
@@ -30,6 +31,7 @@ HOME = os.path.expanduser("~")
 SEP = "<|>"
 DELETED = " (deleted)"
 WORKTREE_RE = re.compile(r"-agent-worktree-(\d+)$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
@@ -108,10 +110,69 @@ def state_cell(state: str, since: str, bell: bool) -> tuple[str, int]:
     return cell, {"done": 0, "working": 1, "idle": 2}.get(state, 3)
 
 
+def state_glyph(state: str, since: str) -> str:
+    """Uncoloured state cell (same width as state_cell's)."""
+    a = age(since)
+    label = {"working": "● working", "done": "✔ done   ", "idle": "○ idle   "}.get(state)
+    return f"{label} {a:>3}" if label else "·" + " " * 12
+
+
+def load_registry(root: str) -> dict[str, tuple[str, str]]:
+    """pi-side-agents registry of a project: tmux window id -> (agent id, parent agent id)."""
+    try:
+        with open(os.path.join(root, ".pi", "side-agents", "registry.json")) as f:
+            agents = json.load(f).get("agents", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    out = {}
+    for rec in agents.values() if isinstance(agents, dict) else ():
+        if isinstance(rec, dict) and rec.get("tmuxWindowId") and rec.get("id"):
+            out[rec["tmuxWindowId"]] = (str(rec["id"]), str(rec.get("parentAgentId") or ""))
+    return out
+
+
+def tree_order(wins: list[tuple]) -> list[tuple[tuple, str, bool, bool]]:
+    """Order a project's windows as a tree: nested side agents right below their parent agent.
+
+    Returns (window, tree prefix, nested, orphan) in display order. Windows whose parent
+    agent has no window (main sessions, top-level agents, orphans) are roots, in index order.
+    """
+    by_agent = {w[9]: w for w in wins if w[9]}
+    children: dict[int, list] = {}
+    roots = []
+    for w in wins:
+        parent = by_agent.get(w[10]) if w[10] else None
+        if parent is not None and parent is not w:
+            children.setdefault(parent[0], []).append(w)
+        else:
+            roots.append(w)
+    out = []
+    seen: set[int] = set()
+
+    def walk(w: tuple, prefix: str, glyph: str, nested: bool) -> None:
+        if w[0] in seen:  # paranoia against parent cycles
+            return
+        seen.add(w[0])
+        out.append((w, prefix + glyph, nested, bool(w[10]) and not nested))
+        kids = children.get(w[0], [])
+        for i, k in enumerate(kids):
+            last = i == len(kids) - 1
+            cont = prefix + ("  " if glyph in ("", "└ ") else "│ ") if nested else ""
+            walk(k, cont, "└ " if last else "├ ", True)
+
+    for w in roots:
+        walk(w, "", "", False)
+    for w in wins:  # anything left over (cycles) still gets listed
+        if w[0] not in seen:
+            walk(w, "", "", False)
+    return out
+
+
 def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
     fmt = SEP.join([
         "#{window_index}", "#{window_name}", "#{window_active}", "#{pane_current_command}",
         "#{pane_current_path}", "#{@agent_state}", "#{@agent_since}", "#{window_bell_flag}", "#{pane_title}",
+        "#{window_id}", "#{@side_agent_id}", "#{@side_agent_parent}",
     ])
     rows = [l.split(SEP) for l in tmux("list-windows", "-t", session, "-F", fmt).split("\n") if l]
     # tmux appends " (deleted)" when the pane's cwd was removed (e.g. a finished side-agent worktree)
@@ -123,11 +184,16 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
     paths = sorted({r[4] for r in rows})
     with ThreadPoolExecutor(max_workers=16) as ex:
         roots = dict(zip(paths, ex.map(project_root, paths)))
+    registries = {root: load_registry(root) for root in set(roots.values())}
 
     groups: dict[str, list] = {}
-    for idx, name, active, cmd, path, state, since, bell, title in rows:
+    for idx, name, active, cmd, path, state, since, bell, title, wid, agent_id, parent_id in rows:
         root = roots[path]
-        groups.setdefault(root, []).append((int(idx), name, active == "1", cmd, path, state, since, bell == "1", title))
+        if not agent_id:  # window not tagged by pi-side-agents (older version): fall back to its registry
+            agent_id, parent_id = registries[root].get(wid, ("", ""))
+        groups.setdefault(root, []).append(
+            (int(idx), name, active == "1", cmd, path, state, since, bell == "1", title, agent_id, parent_id)
+        )
 
     def gkey(root: str):
         return (root != HOME, pretty_path(root).lower())
@@ -136,17 +202,24 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
     meta: list[tuple[str, int]] = []  # per line: ("h", first window idx) or ("w", window idx)
     cur_pos = 1
     for root in sorted(groups, key=gkey):
-        wins = sorted(groups[root])
+        ordered = tree_order(sorted(groups[root]))
         proj = pretty_path(root)
-        counts = {s: sum(1 for w in wins if w[5] == s) for s in ("working", "done")}
+        # nested agents report to their parent agent, not to you: they don't count here
+        counts = {s: sum(1 for w, _, nested, _ in ordered if w[5] == s and not nested) for s in ("working", "done")}
         summary = "".join([
             f"  {BOLD}{GREEN}✔{counts['done']}{RESET}" if counts["done"] else "",
             f"  {YELLOW}●{counts['working']}{RESET}" if counts["working"] else "",
         ])
-        lines.append(f"{wins[0][0]}\t{BOLD}{CYAN}{proj}{RESET}{summary}")
-        meta.append(("h", wins[0][0]))
-        for idx, name, active, cmd, path, state, since, bell, title in wins:
-            cell, _ = state_cell(state, since, bell)
+        first = ordered[0][0][0]
+        lines.append(f"{first}\t{BOLD}{CYAN}{proj}{RESET}{summary}")
+        meta.append(("h", first))
+        for w, tree, nested, orphan in ordered:
+            idx, name, active, cmd, path, state, since, bell, title, agent_id, parent_id = w
+            if nested:
+                # dimmed so a finished grandchild doesn't look like something waiting for you
+                cell = f"{GREY}{state_glyph(state, since)}{RESET}"
+            else:
+                cell, _ = state_cell(state, since, bell)
             label = name
             if cmd and cmd != name and cmd not in ("bash", "zsh", "sh", "node") and not state:
                 label += f" {GREY}[{cmd}]{RESET}"
@@ -155,14 +228,19 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
                 label += f" {GREY}⎇{int(m.group(1))}{RESET}"
             if str(idx) in gone:
                 label += f" {RED}(dir gone){RESET}"
+            if orphan:
+                label += f" {GREY}(parent {parent_id} gone){RESET}"
             sub = pretty_path(path)
             if path != root and not m:
                 label += f" {GREY}{sub}{RESET}"
             summary = pi_summary(title)
             if summary:
                 label += f"  {GREY}{summary}{RESET}"
+            if nested:
+                label = f"{GREY}{re.sub(ANSI_RE, '', label)}{RESET}"
             mark = f"{BOLD}*{RESET}" if active else " "
-            lines.append(f"{idx}\t  {idx:>2}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
+            num = f"   {GREY}{tree}{RESET}{idx:<2}" if tree else f"  {idx:>2}"
+            lines.append(f"{idx}\t{num}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
             meta.append(("w", idx))
             if active:
                 cur_pos = len(lines)
