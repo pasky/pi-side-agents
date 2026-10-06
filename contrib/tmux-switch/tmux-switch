@@ -237,10 +237,9 @@ def build(session: str) -> tuple[list[str], int, list[tuple[str, int]]]:
             if summary:
                 label += f"  {GREY}{summary}{RESET}"
             if nested:
-                label = f"{GREY}{re.sub(ANSI_RE, '', label)}{RESET}"
+                label = f"{GREY}{tree}{re.sub(ANSI_RE, '', label)}{RESET}"
             mark = f"{BOLD}*{RESET}" if active else " "
-            num = f"   {GREY}{tree}{RESET}{idx:<2}" if tree else f"  {idx:>2}"
-            lines.append(f"{idx}\t{num}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
+            lines.append(f"{idx}\t  {idx:>2}{mark} {cell}  {label}  {DIM}{GREY}· {proj}{RESET}")
             meta.append(("w", idx))
             if active:
                 cur_pos = len(lines)
