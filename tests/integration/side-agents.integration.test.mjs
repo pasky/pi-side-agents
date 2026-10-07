@@ -316,8 +316,8 @@ async function waitForBacklogContains(harness, agentId, needle, timeoutMs = 90_0
 		`backlog for ${agentId} to contain ${needle}`,
 		async () => {
 			if (!(await exists(backlogPath))) return false;
-			const raw = await readFile(backlogPath, "utf8");
-			return normalizeScreen(raw).includes(needle);
+			const screen = normalizeScreen(await readFile(backlogPath, "utf8"));
+			return needle instanceof RegExp ? needle.test(screen) : screen.includes(needle);
 		},
 		{ timeoutMs, intervalMs: 350 },
 	);
@@ -335,7 +335,9 @@ async function waitForParentContains(harness, needle, timeoutMs = 60_000) {
 }
 
 async function waitForChildPiBooted(harness, agentId, timeoutMs = 90_000) {
-	return waitForBacklogContains(harness, agentId, "pi v", timeoutMs);
+	// Banner wording differs across pi versions ("pi v…" + "/ for commands" vs
+	// a logo + "/ commands"); the commands hint is in all of them.
+	return waitForBacklogContains(harness, agentId, /\/ (?:for )?commands/, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,7 +1292,7 @@ test(
 
 		// ── Validate backlog captures visible pane content, not just footer ──
 		// After the child has booted, agent-check backlog should contain
-		// meaningful content from the visible tmux pane (e.g. "pi v" version
+		// meaningful content from the visible tmux pane (e.g. the startup banner
 		// string), not just TUI footer/status bar redraws.
 		const bootedCheck = await callAgentCheckTool(harness, agentId, 60_000);
 		assert.equal(bootedCheck.payload.ok, true, "agent-check after boot should succeed");
