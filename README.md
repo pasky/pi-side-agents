@@ -55,6 +55,7 @@ This registers the extension and skill with Pi. Restart Pi after installing.
    - Your main worktree should be clean at this point; avoid editing in the main tree while side agents are active.
    - You can also tell your Pi to open GitHub PRs instead of merging locally, if that's what you prefer.
 5. The agent will merge its work into your main repo. **Just type `/quit` and move on.**
+   - The tmux window closes by itself on a clean exit (it pauses with a press-any-key prompt on failure). Set `PI_SIDE_AGENT_NOCLOSE=1` before starting pi to always get the prompt.
    - Old worktrees are kept around and reused and updated by new agents.
    - Old branches are auto-pruned during reuse by a new agent.
    - You can pause your work on a topic—if you `/quit` before work is merged, the branch will stay around.

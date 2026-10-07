@@ -19,6 +19,9 @@ const ENV_PARENT_BRANCH = "PI_SIDE_PARENT_BRANCH";
 const ENV_PARENT_AGENT_ID = "PI_SIDE_PARENT_AGENT_ID";
 /** Nesting depth: main session = 0, its children = 1, grandchildren = 2. */
 const ENV_DEPTH = "PI_SIDE_AGENT_DEPTH";
+/** Opt-out of auto-closing a child's tmux window after a clean exit: when set
+ * (non-empty, not "0"), the window waits for a keypress as it used to. */
+const ENV_NOCLOSE = "PI_SIDE_AGENT_NOCLOSE";
 /** Deepest agent that may exist; agents at this depth cannot spawn further. */
 const MAX_AGENT_DEPTH = 2;
 
@@ -1498,6 +1501,8 @@ function buildLaunchScript(params: {
 	/** "session" continues the file in place (cwd matches); "fork" re-homes it into this worktree. */
 	sessionMode?: "session" | "fork";
 }): string {
+	const noCloseRaw = process.env[ENV_NOCLOSE] ?? "";
+	const noClose = noCloseRaw !== "" && noCloseRaw !== "0";
 	return `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -1516,6 +1521,7 @@ MODEL_SPEC=${shellQuote(params.modelSpec ?? "")}
 SESSION_FILE=${shellQuote(params.sessionPath ?? "")}
 SESSION_FLAG=${shellQuote(params.sessionMode === "session" ? "--session" : "--fork")}
 RUNTIME_DIR=${shellQuote(params.runtimeDir)}
+NOCLOSE=${shellQuote(noClose ? "1" : "")}
 START_SCRIPT=\"$WORKTREE/.pi/side-agent-start.sh\"
 CHILD_SKILLS_DIR=\"$WORKTREE/.pi/side-agent-skills\"
 
@@ -1527,6 +1533,8 @@ export ${ENV_PARENT_AGENT_ID}=\"$PARENT_AGENT_ID\"
 export ${ENV_DEPTH}=\"$AGENT_DEPTH\"
 export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
+# Propagate to nested agents (tmux windows don't inherit the parent pi's env).
+export ${ENV_NOCLOSE}=\"$NOCLOSE\"
 
 iso_now() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -1550,6 +1558,17 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# Close this tmux window. A clean exit closes it right away; a failure (or
+# ${ENV_NOCLOSE}) waits for a keypress so the output stays readable.
+close_window() {
+  local code="$1"
+  if [[ -n "$NOCLOSE" || "$code" -ne 0 ]]; then
+    read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
+    echo
+  fi
+  tmux kill-window -t "$WINDOW_ID" || true
+}
+
 cd "$WORKTREE"
 
 if [[ -x "$START_SCRIPT" ]]; then
@@ -1560,9 +1579,7 @@ if [[ -x "$START_SCRIPT" ]]; then
   if [[ "$start_exit" -ne 0 ]]; then
     echo "[side-agent] start script failed with code $start_exit"
     write_exit "$start_exit"
-    read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
-    echo
-    tmux kill-window -t "$WINDOW_ID" || true
+    close_window "$start_exit"
     exit "$start_exit"
   fi
 fi
@@ -1596,10 +1613,7 @@ else
   echo "[side-agent] Agent exited with code $exit_code."
 fi
 
-read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
-echo
-
-tmux kill-window -t "$WINDOW_ID" || true
+close_window "$exit_code"
 `;
 }
 

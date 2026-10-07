@@ -528,15 +528,27 @@ async function resolveChildWindowId(harness, agentId) {
 	return undefined;
 }
 
-async function closeChildWindowAfterPrompt(harness, agentId, windowIdHint) {
-	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
-
+/**
+ * Make sure a finished child's tmux window goes away. A clean exit (record
+ * pruned) must auto-close the window by itself; a failed exit or a harness
+ * with PI_SIDE_AGENT_NOCLOSE keeps the press-any-key prompt, which we answer.
+ */
+async function closeChildWindow(harness, agentId, windowIdHint) {
 	const terminalRecord = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 }).catch(
 		() => undefined,
 	);
 	const windowId = windowIdHint || terminalRecord?.tmuxWindowId || (await resolveChildWindowId(harness, agentId));
 	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId (registry/launch.sh fallback)`);
 
+	if (!harness.noClose && terminalRecord?.status === "cleaned_up") {
+		await waitFor(`tmux window ${windowId} to auto-close after clean exit`, async () => !windowExists(harness, windowId), {
+			timeoutMs: 30_000,
+			intervalMs: 250,
+		});
+		return;
+	}
+
+	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
 	if (!windowExists(harness, windowId)) {
 		return;
 	}
@@ -686,6 +698,7 @@ exec pi --model ${JSON.stringify(MODEL_SPEC)} --thinking minimal --session-dir $
 		PI_CODING_AGENT_DIR: agentDir,
 		PI_SIDE_AGENTS_ROOT: repoRoot,
 		PI_OFFLINE: "1",
+		PI_SIDE_AGENT_NOCLOSE: options.noClose ? "1" : "",
 	};
 
 	tmux(
@@ -702,6 +715,7 @@ exec pi --model ${JSON.stringify(MODEL_SPEC)} --thinking minimal --session-dir $
 		tmuxSocket,
 		sessionName,
 		parentTarget: `${sessionName}:0`,
+		noClose: Boolean(options.noClose),
 	};
 
 	t.after(async () => {
@@ -767,12 +781,12 @@ function spawnWithCapture(command, args, options = {}) {
 }
 
 test(
-	"integration: /agent launch + agent-check/agent-send tools + child press-any-key close",
+	"integration: /agent launch + agent-check/agent-send tools + child press-any-key close (PI_SIDE_AGENT_NOCLOSE)",
 	{ timeout: TEST_TIMEOUT },
 	async (t) => {
 		if (!assertAuthOrSkip(t)) return;
 
-		const harness = await createHarness(t);
+		const harness = await createHarness(t, { noClose: true });
 
 		const started = await startAgentViaSlashCommand(harness, "integration scenario one");
 		const agentId = started.id;
@@ -852,7 +866,7 @@ test(
 			`expected unknown-agent error after cleanup: ${JSON.stringify(doneCheck.payload)}`,
 		);
 
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -921,7 +935,7 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -948,7 +962,7 @@ test(
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -975,7 +989,7 @@ test(
 		assert.equal(firstQuitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(firstQuitSend.payload)}`);
 		await callAgentSendTool(harness, firstId, "!/quit", 60_000);
 		await waitForAgent(harness, firstId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, firstId);
+		await closeChildWindow(harness, firstId);
 
 		const firstLockPath = join(first.worktreePath, ".pi", "active.lock");
 		if (await exists(firstLockPath)) {
@@ -992,7 +1006,7 @@ test(
 		assert.equal(secondQuitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(secondQuitSend.payload)}`);
 		await callAgentSendTool(harness, secondId, "!/quit", 60_000);
 		await waitForAgent(harness, secondId, { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, secondId);
+		await closeChildWindow(harness, secondId);
 	},
 );
 
@@ -1040,11 +1054,8 @@ test(
 		await waitForAgent(harness, firstId, { terminal: true, timeoutMs: 120_000 });
 		await waitForAgent(harness, secondId, { terminal: true, timeoutMs: 180_000 });
 
-		await waitForBacklogContains(harness, firstId, "Press any key to close this tmux window", 60_000);
-		await waitForBacklogContains(harness, secondId, "Press any key to close this tmux window", 60_000);
-
-		await closeChildWindowAfterPrompt(harness, firstId);
-		await closeChildWindowAfterPrompt(harness, secondId);
+		await closeChildWindow(harness, firstId);
+		await closeChildWindow(harness, secondId);
 	},
 );
 
@@ -1315,7 +1326,7 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -1450,7 +1461,7 @@ test(
 			`error should explain missing/pruned id, got: ${wp.error}`,
 		);
 
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -1600,7 +1611,7 @@ test(
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `quit agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-		await closeChildWindowAfterPrompt(harness, agentId);
+		await closeChildWindow(harness, agentId);
 	},
 );
 
@@ -1766,7 +1777,7 @@ test(
 		// 5. inner quits → outer gets the terminal notice; main still hears nothing about inner.
 		await sendChildCommand(harness, inner.tmuxWindowId, "/quit");
 		await waitForAgentRemoved(harness, "inner", 120_000);
-		await closeChildWindowAfterPrompt(harness, "inner", inner.tmuxWindowId).catch(() => {});
+		await closeChildWindow(harness, "inner", inner.tmuxWindowId).catch(() => {});
 		await waitFor(
 			"outer session to receive inner's terminal notice",
 			async () =>
@@ -1794,6 +1805,6 @@ test(
 		// Cleanup outer.
 		await sendChildCommand(harness, outer.tmuxWindowId, "/quit");
 		await waitForAgent(harness, "outer", { terminal: true, timeoutMs: 180_000 });
-		await closeChildWindowAfterPrompt(harness, "outer", outer.tmuxWindowId);
+		await closeChildWindow(harness, "outer", outer.tmuxWindowId);
 	},
 );
