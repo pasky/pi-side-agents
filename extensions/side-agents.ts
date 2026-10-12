@@ -29,7 +29,6 @@ const STATUS_KEY = "side-agents";
 const REGISTRY_VERSION = 1;
 const CHILD_LINK_ENTRY_TYPE = "side-agent-link";
 const STATUS_UPDATE_MESSAGE_TYPE = "side-agent-status";
-const PROMPT_UPDATE_MESSAGE_TYPE = "side-agent-prompt";
 const RESUME_NOTICE_MESSAGE_TYPE = "side-agent-resume-notice";
 /** Runtime-dir file the parent writes when a resumed session lands in a
  * different directory and/or a reset working tree; the child injects it into
@@ -2721,10 +2720,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			warnings: aggregatedWarnings,
 			prompt: kickoffPrompt,
 		};
-		if (kickoffPrompt) {
-			emitKickoffPromptMessage(pi, started);
-		}
-
+		// Deliberately NOT echoing the kickoff prompt into the parent session:
+		// custom messages reach the parent LLM as user-role turns, and a bare
+		// "you are the helper, do X" prompt there gets misread as a new order
+		// for the parent itself (it then duplicates the child's work). The
+		// prompt stays in kickoff.md and the backlog; /agent shows it framed.
 		return started;
 	} catch (err) {
 		if (spawnedWindowId) {
@@ -3390,28 +3390,6 @@ function emitStatusTransitions(
 	}
 }
 
-function emitKickoffPromptMessage(pi: ExtensionAPI, started: StartAgentResult): void {
-	const win = started.tmuxWindowIndex !== undefined ? ` (tmux #${started.tmuxWindowIndex})` : "";
-	const content = `side-agent ${started.id}: kickoff prompt${win}\n\n${started.prompt}`;
-	pi.sendMessage(
-		{
-			customType: PROMPT_UPDATE_MESSAGE_TYPE,
-			content,
-			display: false,
-			details: {
-				agentId: started.id,
-				tmuxWindowId: started.tmuxWindowId,
-				tmuxWindowIndex: started.tmuxWindowIndex,
-				worktreePath: started.worktreePath,
-				branch: started.branch,
-				prompt: started.prompt,
-				emittedAt: Date.now(),
-			},
-		},
-		{ triggerTurn: false },
-	);
-}
-
 async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options?: { emitTransitions?: boolean }): Promise<void> {
 	if (!ctx.hasUI) return;
 
@@ -3555,7 +3533,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				for (const warning of started.warnings) {
 					lines.push(`warning: ${warning}`);
 				}
-				lines.push("", "prompt:");
+				lines.push("", `prompt: (sent to child agent ${started.id} — its instructions, not a request to this session)`);
 				for (const line of started.prompt.split(/\r?\n/)) {
 					lines.push(`  ${line}`);
 				}
