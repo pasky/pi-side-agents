@@ -1302,7 +1302,7 @@ test("agent-resume slot preference — original session dir is scanned first", (
 //    of getSelfIdentity / isOwnedBySelf / isOrphanRecord / isSiblingRecord)
 // ---------------------------------------------------------------------------
 
-const MAX_AGENT_DEPTH = 2;
+const MAX_AGENT_DEPTH = 3;
 
 /** @param {{PI_SIDE_AGENT_ID?:string, PI_SIDE_PARENT_AGENT_ID?:string, PI_SIDE_AGENT_DEPTH?:string}} env */
 function getSelfIdentityPort(env) {
@@ -1409,11 +1409,13 @@ test("nested: status line shows parent (if not main) + own children + siblings",
 	assert.deepStrictEqual(statusLineScopePort(TREE, B), { parent: undefined, children: [], siblings: ["a"] });
 });
 
-test("nested: depth cap — grandchildren cannot spawn", () => {
+test("nested: depth cap — great-grandchildren cannot spawn", () => {
 	const canSpawn = (self) => self.depth + 1 <= MAX_AGENT_DEPTH;
+	const A1X = getSelfIdentityPort({ PI_SIDE_AGENT_ID: "a1x", PI_SIDE_PARENT_AGENT_ID: "a1", PI_SIDE_AGENT_DEPTH: "3" });
 	assert.strictEqual(canSpawn(MAIN), true);
 	assert.strictEqual(canSpawn(A), true);
-	assert.strictEqual(canSpawn(A1), false);
+	assert.strictEqual(canSpawn(A1), true);
+	assert.strictEqual(canSpawn(A1X), false);
 });
 
 /**

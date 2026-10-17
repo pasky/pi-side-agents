@@ -17,13 +17,13 @@ const ENV_RUNTIME_DIR = "PI_SIDE_RUNTIME_DIR";
 const ENV_PARENT_BRANCH = "PI_SIDE_PARENT_BRANCH";
 /** Agent id of the session that spawned this one; unset when spawned by the main session. */
 const ENV_PARENT_AGENT_ID = "PI_SIDE_PARENT_AGENT_ID";
-/** Nesting depth: main session = 0, its children = 1, grandchildren = 2. */
+/** Nesting depth: main session = 0, its children = 1, grandchildren = 2, … */
 const ENV_DEPTH = "PI_SIDE_AGENT_DEPTH";
 /** Opt-out of auto-closing a child's tmux window after a clean exit: when set
  * (non-empty, not "0"), the window waits for a keypress as it used to. */
 const ENV_NOCLOSE = "PI_SIDE_AGENT_NOCLOSE";
 /** Deepest agent that may exist; agents at this depth cannot spawn further. */
-const MAX_AGENT_DEPTH = 2;
+const MAX_AGENT_DEPTH = 3;
 
 const STATUS_KEY = "side-agents";
 const REGISTRY_VERSION = 1;
@@ -3841,7 +3841,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 2); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 3); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),

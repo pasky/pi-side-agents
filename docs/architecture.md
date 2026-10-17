@@ -208,7 +208,7 @@ The child session uses these to link itself into the parent registry and to upda
 
 ### 6.4 Nested side agents
 
-A side agent may itself call `agent-start` (or `/agent`); depth is capped at `MAX_AGENT_DEPTH = 2`, so grandchildren cannot spawn further.
+A side agent may itself call `agent-start` (or `/agent`); depth is capped at `MAX_AGENT_DEPTH = 3`, so great-grandchildren cannot spawn further. (A depth-2 chair needs to spawn its own workers, e.g. board seats.)
 
 - Registry, id de-duplication and worktree slots are shared across all levels (`PI_SIDE_AGENTS_ROOT` is inherited). Records carry `parentAgentId` and `depth`.
 - The grandchild's tmux window is opened in the same tmux session as everything else.
@@ -315,7 +315,7 @@ Output (success):
 
 Notes:
 
-- `parentAgentId` is present (and `depth` is 2) when the caller is itself a side agent; calls from depth 2 fail with `ok: false`.
+- `parentAgentId` is present (and `depth` is ≥ 2) when the caller is itself a side agent; calls from depth 3 fail with `ok: false`.
 - The `description` is sent verbatim.
 - No parent context summary is added for tool-started agents.
 
