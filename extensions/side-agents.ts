@@ -134,6 +134,10 @@ type StartAgentParams = {
 		agentIdHint?: string;
 		/** Pre-existing side-agent branch to reattach; omit to start a fresh branch. */
 		branch?: string;
+		/** The session is the newest one recorded in its original slot, so if that
+		 * slot now sits on a different unmerged branch, the session itself switched
+		 * to it (e.g. `git checkout -b` mid-task) and it may be adopted. */
+		lastSessionInSlot?: boolean;
 	};
 };
 
@@ -1205,6 +1209,35 @@ type AllocateWorktreeOptions = Parameters<typeof allocateWorktreeUnlocked>[0];
  * be slow on big repos, so wait long and only break the lock if its holder pid
  * is dead — a live (if slow) holder is never evicted.
  */
+/**
+ * Resume mode, expected branch gone: is the session's original slot sitting on
+ * a branch the session itself moved to? Adopt it only when the slot is free
+ * (no lock, no live claim), holds a branch with commits not in mainHead, and
+ * that branch is not some live agent's side-agent/<id>. The caller guarantees
+ * no newer session ran in this slot, so nobody else can have created it.
+ */
+async function findDriftedSlotBranch(
+	repoRoot: string,
+	registry: RegistryFile,
+	slots: WorktreeSlot[],
+	slotPath: string,
+	mainHead: string,
+	claims: { claimedByActiveAgent: Set<string>; pinnedAsParentCheckout: Set<string> },
+): Promise<{ slot: WorktreeSlot; branch: string } | undefined> {
+	const slot = slots.find((s) => resolve(s.path) === slotPath);
+	if (!slot || !listRegisteredWorktrees(repoRoot).has(slotPath)) return undefined;
+	if (await fileExists(join(slot.path, ".pi", "active.lock"))) return undefined;
+	if (claims.claimedByActiveAgent.has(slotPath) || claims.pinnedAsParentCheckout.has(slotPath)) return undefined;
+	const current = getCurrentBranch(slot.path);
+	if (!current) return undefined;
+	if (current.startsWith("side-agent/")) {
+		const owner = registry.agents[current.slice("side-agent/".length)];
+		if (owner && !isTerminalStatus(owner.status)) return undefined;
+	}
+	if (run("git", ["-C", repoRoot, "merge-base", "--is-ancestor", `refs/heads/${current}`, mainHead]).ok) return undefined;
+	return { slot, branch: current };
+}
+
 async function allocateWorktree(options: AllocateWorktreeOptions): Promise<AllocateWorktreeResult> {
 	return withFileLock(getWorktreeAllocLockPath(options.stateRoot), () => allocateWorktreeUnlocked(options), {
 		timeoutMs: 10 * 60_000,
@@ -1222,6 +1255,9 @@ async function allocateWorktreeUnlocked(options: {
 	/** Resume mode: the session's original cwd; when it is a free slot, prefer it
 	 * over other free slots so the resumed conversation's paths stay valid. */
 	preferredPath?: string;
+	/** Resume mode: when existingBranch is gone, preferredPath's slot may be
+	 * resumed in place on whatever unmerged branch it holds (see StartAgentParams). */
+	adoptPreferredSlotBranch?: boolean;
 	/** Commit to base a fresh branch on; defaults to the main repo's HEAD. A nested
 	 * agent passes its own HEAD so the grandchild's work builds on the child's branch. */
 	baseHead?: string;
@@ -1229,7 +1265,7 @@ async function allocateWorktreeUnlocked(options: {
 	const { repoRoot, stateRoot, agentId, parentSessionId, existingBranch, preferredPath } = options;
 
 	const warnings: string[] = [];
-	const branch = existingBranch ?? `side-agent/${agentId}`;
+	let branch = existingBranch ?? `side-agent/${agentId}`;
 	const mainHead = options.baseHead ?? runOrThrow("git", ["-C", repoRoot, "rev-parse", "HEAD"]).stdout.trim();
 
 	const registry = await loadRegistry(stateRoot);
@@ -1266,7 +1302,22 @@ async function allocateWorktreeUnlocked(options: {
 	let resumeInPlace = false;
 	if (existingBranch) {
 		resumeBranchExists = run("git", ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).ok;
-		if (!resumeBranchExists) {
+		const drifted =
+			!resumeBranchExists && options.adoptPreferredSlotBranch && preferredPath
+				? await findDriftedSlotBranch(repoRoot, registry, slots, resolve(preferredPath), mainHead, {
+						claimedByActiveAgent,
+						pinnedAsParentCheckout,
+					})
+				: undefined;
+		if (drifted) {
+			warnings.push(
+				`Branch ${branch} no longer exists, but the session's worktree ${drifted.slot.path} is on unmerged branch ${drifted.branch} (the session switched to it); resuming there in place.`,
+			);
+			branch = drifted.branch;
+			resumeBranchExists = true;
+			chosen = drifted.slot;
+			resumeInPlace = true;
+		} else if (!resumeBranchExists) {
 			warnings.push(`Branch ${branch} no longer exists (pruned as fully merged); recreating it from current HEAD.`);
 		} else {
 			const holder = findWorktreeForBranch(repoRoot, branch);
@@ -2236,8 +2287,14 @@ async function scanSessionFile(sessionPath: string): Promise<ScannedSession> {
  */
 async function listResumableSessions(stateRoot: string, repoRoot: string): Promise<ResumableSession[]> {
 	const registry = await refreshAllAgents(stateRoot);
+	// Failed/crashed records are dead processes kept only for inspection: their
+	// sessions are exactly what one wants to resume (e.g. after a reboot killed
+	// tmux), so they neither hide their session nor hold their branch.
+	const liveAgentIds = new Set<string>();
 	const activeSessionPaths = new Set<string>();
 	for (const record of Object.values(registry.agents)) {
+		if (isTerminalStatus(record.status)) continue;
+		liveAgentIds.add(record.id);
 		if (record.childSessionId) activeSessionPaths.add(resolve(record.childSessionId));
 	}
 
@@ -2274,7 +2331,7 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 	// Seed with active agents' ids: their sessions are excluded from candidates,
 	// but their branches are live and must not be reattached to older sessions
 	// that happen to share the same agent id.
-	const seenAgentIds = new Set<string>(Object.keys(registry.agents));
+	const seenAgentIds = new Set<string>(liveAgentIds);
 	for (const file of files) {
 		if (activeSessionPaths.has(resolve(file.path))) continue;
 		const scanned = await scanSessionFile(file.path);
@@ -2287,7 +2344,7 @@ async function listResumableSessions(stateRoot: string, repoRoot: string): Promi
 		seenAgentIds.add(scanned.agentId);
 		const branch = branchHeldElsewhere ? undefined : `side-agent/${scanned.agentId}`;
 		const branchHeldBy = branchHeldElsewhere
-			? registry.agents[scanned.agentId]
+			? liveAgentIds.has(scanned.agentId)
 				? ("active-agent" as const)
 				: ("newer-session" as const)
 			: undefined;
@@ -2475,7 +2532,15 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			? resumeBranch.slice("side-agent/".length)
 			: undefined;
 
+		let superseded: AgentRecord | undefined;
 		await mutateRegistry(stateRoot, async (registry) => {
+			// Resuming a failed/crashed agent's session: its record describes a dead
+			// process; the resume takes over its id (and below, its worktree lock).
+			const stale = reattachId ? registry.agents[reattachId] : undefined;
+			if (stale && (stale.status === "failed" || stale.status === "crashed")) {
+				superseded = stale;
+				delete registry.agents[stale.id];
+			}
 			const existing = existingAgentIds(registry, repoRoot);
 			if (reattachId && !registry.agents[reattachId]) {
 				// The resumed session's own branch (parked by /quit) must not force
@@ -2497,6 +2562,15 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			};
 		});
 
+		if (superseded) {
+			const stale: AgentRecord = superseded;
+			await cleanupWorktreeLockBestEffort(stale.worktreePath, stale.id);
+			aggregatedWarnings.push(
+				`Replaced the ${stale.status} registry record of ${stale.id}${
+					stale.worktreePath ? ` and released its worktree lock (${stale.worktreePath})` : ""
+				}.`,
+			);
+		}
 		if (params.resume && !resumeBranch) {
 			aggregatedWarnings.push("Resuming on a fresh branch (original branch is owned elsewhere or unknown).");
 		}
@@ -2517,6 +2591,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			parentSessionId,
 			existingBranch: resumeBranch,
 			preferredPath: params.resume?.sessionCwd,
+			adoptPreferredSlotBranch: params.resume?.lastSessionInSlot,
 			baseHead: self.selfId ? runOrThrow("git", ["-C", parentCheckout, "rev-parse", "HEAD"]).stdout.trim() : undefined,
 		});
 		allocatedWorktreePath = worktree.worktreePath;
@@ -3780,12 +3855,26 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				// a newer candidate session (allocateWorktree's lock checks remain the
 				// final backstop).
 				const registry = await loadRegistry(stateRoot);
+				const record = registry.agents[authoritativeId];
 				const ownedByNewerCandidate = candidates.some(
 					(c) => c.path !== candidate.path && c.agentId === authoritativeId && c.modified > candidate.modified,
 				);
 				branch =
-					registry.agents[authoritativeId] || ownedByNewerCandidate ? undefined : `side-agent/${authoritativeId}`;
+					(record && !isTerminalStatus(record.status)) || ownedByNewerCandidate
+						? undefined
+						: `side-agent/${authoritativeId}`;
 			}
+
+			const slotCwd = candidate.sessionCwd ? resolve(candidate.sessionCwd) : undefined;
+			const lastSessionInSlot =
+				slotCwd !== undefined &&
+				!candidates.some(
+					(c) =>
+						c.path !== candidate.path &&
+						c.sessionCwd !== undefined &&
+						resolve(c.sessionCwd) === slotCwd &&
+						c.modified > candidate.modified,
+				);
 
 			try {
 				ctx.ui.notify("Resuming side-agent…", "info");
@@ -3797,6 +3886,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 						sessionCwd: candidate.sessionCwd,
 						agentIdHint,
 						branch,
+						lastSessionInSlot,
 					},
 				});
 
@@ -4002,4 +4092,4 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 }
 
 /** Internals exposed for unit tests only (Pi loads just the default export). */
-export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock, formatStatusLine };
+export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock, formatStatusLine, listResumableSessions };

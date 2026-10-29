@@ -236,3 +236,87 @@ test("withFileLock — a breaker left behind by a dead process does not block re
 	}, { timeoutMs: 5_000, staleMs: Number.POSITIVE_INFINITY });
 	assert.equal(ran, true);
 });
+
+// ---------------------------------------------------------------------------
+// /agent-resume: dead agents and sessions that switched branches
+// ---------------------------------------------------------------------------
+
+test("listResumableSessions — failed/crashed agents' sessions are offered with their branch; live ones are not", async (t) => {
+	const { root, repoRoot } = await makeRepo(t, 2);
+	const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(root, "pi-agent");
+	t.after(() => {
+		if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+	});
+	const sessionPaths = {};
+	const agents = {};
+	for (const [i, [id, status]] of [["old-1", "crashed"], ["old-2", "running"]].entries()) {
+		const slot = join(root, `repo-agent-worktree-000${i + 1}`);
+		const dir = join(root, "pi-agent", "sessions", `--${slot.replace(/^\//, "").replace(/[/\\:]/g, "-")}--`);
+		await mkdir(dir, { recursive: true });
+		sessionPaths[id] = join(dir, `2026-01-0${i + 1}T00-00-00-000Z_x.jsonl`);
+		await writeFile(
+			sessionPaths[id],
+			[
+				{ type: "session", cwd: slot },
+				{ type: "message", message: { role: "user", content: `task ${id}` } },
+				{ type: "custom", customType: "side-agent-link", data: { agentId: id } },
+			].map((e) => JSON.stringify(e)).join("\n") + "\n",
+		);
+		agents[id] = { id, status, childSessionId: sessionPaths[id], worktreePath: slot, task: id, startedAt: "x", updatedAt: "x" };
+	}
+	await mkdir(join(repoRoot, ".pi", "side-agents"), { recursive: true });
+	await writeFile(join(repoRoot, ".pi", "side-agents", "registry.json"), JSON.stringify({ version: 1, agents }));
+
+	const candidates = await __testing.listResumableSessions(repoRoot, repoRoot);
+	assert.deepEqual(
+		candidates.map((c) => [c.agentId, c.branch, c.branchExists]),
+		[["old-1", "side-agent/old-1", true]],
+	);
+});
+
+async function makeDriftedSlot(t, { merged = false } = {}) {
+	const { repoRoot } = await makeRepo(t, 1);
+	const slot = join(dirname(repoRoot), "repo-agent-worktree-0001");
+	// The session's agent was finished+pruned, then switched its slot to a new branch.
+	git(["checkout", "-q", "--detach"], slot);
+	git(["branch", "-D", "side-agent/old-1"], repoRoot);
+	git(["checkout", "-q", "-b", "side-agent/follow-up"], slot);
+	if (!merged) {
+		await writeFile(join(slot, "work"), "unmerged\n");
+		git(["add", "work"], slot);
+		git(["commit", "-q", "-m", "follow-up work"], slot);
+	}
+	return { repoRoot, slot, head: git(["rev-parse", "HEAD"], slot) };
+}
+
+function resumeAlloc(repoRoot, slot, adoptPreferredSlotBranch) {
+	return __testing.allocateWorktree({
+		repoRoot,
+		stateRoot: repoRoot,
+		agentId: "old-1",
+		existingBranch: "side-agent/old-1",
+		preferredPath: slot,
+		adoptPreferredSlotBranch,
+	});
+}
+
+test("allocateWorktree resume — adopts the unmerged branch the session switched to in its own slot", async (t) => {
+	const { repoRoot, slot, head } = await makeDriftedSlot(t);
+	const r = await resumeAlloc(repoRoot, slot, true);
+	assert.equal(r.worktreePath, slot);
+	assert.equal(r.branch, "side-agent/follow-up");
+	assert.equal(r.workingTreePreserved, true);
+	assert.equal(git(["rev-parse", "HEAD"], slot), head);
+});
+
+test("allocateWorktree resume — no adoption when a newer session used the slot or the branch is merged", async (t) => {
+	for (const [adopt, merged] of [[false, false], [true, true]]) {
+		const { repoRoot, slot, head } = await makeDriftedSlot(t, { merged });
+		const r = await resumeAlloc(repoRoot, slot, adopt);
+		assert.equal(r.branch, "side-agent/old-1");
+		assert.equal(r.workingTreePreserved, false);
+		if (!merged) assert.equal(git(["rev-parse", "refs/heads/side-agent/follow-up"], repoRoot), head, "drifted branch survives");
+	}
+});

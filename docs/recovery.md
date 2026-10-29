@@ -94,11 +94,11 @@ tail -n 120 ".pi/side-agents/runtime/$ID/backlog.log"
 agent-send { "id": "<id>", "prompt": "!/quit" }
 ```
 
-4. If tmux window is gone, treat as terminal crash:
+4. If tmux window is gone (e.g. after a reboot or tmux server restart), treat as terminal crash:
 
 - collect backlog/error
-- spawn a replacement agent if needed (`/agent ...` or `agent-start`)
-- clean up old failed/crashed record (see section 5)
+- usually just `/agent-resume` it: failed/crashed agents' sessions are listed there, and resuming one replaces its stale registry record and releases its worktree lock
+- or spawn a replacement agent (`/agent ...` or `agent-start`) and clean up the old record (see section 5)
 
 ---
 
