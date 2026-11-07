@@ -545,13 +545,25 @@ function runOrThrow(command: string, args: string[], options?: { cwd?: string; i
 	return result;
 }
 
+// The status poller resolves the git root every 2.5s. Spawning git is not
+// cheap: on macOS, libuv tries posix_spawn() once per PATH entry, and every
+// miss creates a throwaway process that syspolicyd then inspects (libuv PR
+// #5390). Cache it: found roots don't move; "not a repo" is re-checked after
+// a while in case the user runs `git init`.
+const GIT_ROOT_MISS_TTL_MS = 60_000;
+const gitRootCache = new Map<string, { root: string; isRepo: boolean; at: number }>();
+
 function resolveGitRoot(cwd: string): string {
+	const cached = gitRootCache.get(cwd);
+	if (cached && (cached.isRepo || Date.now() - cached.at < GIT_ROOT_MISS_TTL_MS)) return cached.root;
+
 	const result = run("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
-	if (result.ok) {
-		const root = result.stdout.trim();
-		if (root.length > 0) return resolve(root);
-	}
-	return resolve(cwd);
+	const toplevel = result.ok ? result.stdout.trim() : "";
+	const entry = toplevel.length > 0
+		? { root: resolve(toplevel), isRepo: true, at: Date.now() }
+		: { root: resolve(cwd), isRepo: false, at: Date.now() };
+	gitRootCache.set(cwd, entry);
+	return entry.root;
 }
 
 function getCurrentBranch(cwd: string): string {
