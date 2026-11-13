@@ -19,7 +19,7 @@ Run multiple Pi coding tasks in parallel without blocking the main session:
 
 ### Commands
 
-- `/agent [-model <provider/id-or-pattern>] <task>` — spawn a child agent.
+- `/agent [-model <provider/id-or-pattern>] [-mode <name>] <task>` — spawn a child agent.
 - `/agents` — list tracked agents, show orphan worktree locks, offer interactive cleanup.
 - `/agent-resume` — pick a previously `/quit` child session and reopen it (conversation + branch) in a worktree/tmux window.
 
@@ -304,8 +304,10 @@ If your finish script uses a parent-side merge critical section, it typically im
 Input:
 
 ```json
-{ "description": "...", "branchHint": "fix-auth-leak", "model": "optional" }
+{ "description": "...", "branchHint": "fix-auth-leak", "model": "optional", "mode": "optional" }
 ```
+
+`mode` is a pi-amplike mode name, resolved to `provider/modelId[:thinking]` via `.pi/modes.json` (project) or `<agent dir>/modes.json`. An explicit `model` wins; an unknown mode adds a warning and the child inherits the parent's model.
 
 Output (success):
 

@@ -17,7 +17,7 @@ The most advanced users of AI coding agents have worked like this for a while, b
 
 ## What it does
 
-- New command `/agent [-model ...] <task>` to spawn a background child Pi agent.
+- New command `/agent [-model ...] [-mode ...] <task>` to spawn a background child Pi agent.
 - Shows active-agent summary with tmux window numbers in the statusline, color-coded by status — a quick-travel map for hopping across side agents one by one (nested agents also see their parent and siblings there).
 - New command `/agents` to inspect current agents and clean up stale state.
 - New command `/agent-resume` to pick a previously `/quit` side-agent session and reopen it (conversation + branch) in a worktree/tmux window.
@@ -44,6 +44,7 @@ This registers the extension and skill with Pi. Restart Pi after installing.
 2. **Spawn asynchronous work items at any point** during your work:
    - `/agent wait, why is weirdMethod doing something-weird?`
    - `/agent -model gpt-5.3-codex add regression tests for auth`
+   - `/agent -mode rush fix the typo in the README` (with [pi-amplike](https://github.com/pasky/pi-amplike) modes; the `agent-start` tool takes `mode` too)
    - Keep firing new items as they appear. As a rule of thumb, start all new work via `/agent`, but you can also use it only for ad hoc side questions.
 3. **Check progress and attend** to the baby agents:
    - Check the statusline for which agents (by branch and tmux window) are waiting for you.

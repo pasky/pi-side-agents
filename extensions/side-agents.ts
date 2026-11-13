@@ -121,6 +121,8 @@ type StartAgentParams = {
 	task: string;
 	branchHint?: string;
 	model?: string;
+	/** pi-amplike mode name (modes.json); an explicit `model` takes precedence. */
+	mode?: string;
 	includeSummary: boolean;
 	/** Resume a previously quit child session instead of starting fresh. */
 	resume?: {
@@ -1984,6 +1986,24 @@ async function inferCurrentModeModelSpec(
 	return undefined;
 }
 
+/**
+ * Pick the model request for a new child from an explicit model and/or a
+ * pi-amplike mode name. An explicit model wins; an unresolvable mode yields a
+ * warning and no model (the child then inherits the parent's).
+ */
+async function resolveRequestedModel(
+	cwd: string,
+	model: string | undefined,
+	mode: string | undefined,
+): Promise<{ model?: string; warning?: string }> {
+	if (model?.trim()) return { model };
+	const modeName = mode?.trim();
+	if (!modeName) return {};
+	const resolved = await resolveModeToModelSpec(cwd, modeName);
+	if (resolved.modelSpec) return { model: resolved.modelSpec };
+	return { warning: `${resolved.warning ?? `Could not resolve mode '${modeName}'`}; child inherits the current model.` };
+}
+
 function parseAgentCommandArgs(raw: string): { task: string; model?: string; mode?: string } {
 	let rest = raw;
 	let model: string | undefined;
@@ -2668,9 +2688,11 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		// Resumed sessions restore their own recorded model; only pass --model for
 		// fresh agents (or an explicit override).
+		const requested = await resolveRequestedModel(ctx.cwd, params.model, params.mode);
+		if (requested.warning) aggregatedWarnings.push(requested.warning);
 		const resolvedModel = params.resume
-			? { modelSpec: params.model }
-			: await resolveModelSpecForChild(ctx, params.model, pi.getThinkingLevel());
+			? { modelSpec: requested.model }
+			: await resolveModelSpecForChild(ctx, requested.model, pi.getThinkingLevel());
 		const modelSpec = resolvedModel.modelSpec;
 		if (resolvedModel.warning) aggregatedWarnings.push(resolvedModel.warning);
 
@@ -3579,22 +3601,13 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			// Resolve -mode (pi-amplike modes) to a model spec if no explicit -model was given.
-			let resolvedModel = parsed.model;
-			if (parsed.mode && !parsed.model) {
-				const modeResult = await resolveModeToModelSpec(ctx.cwd, parsed.mode);
-				if (modeResult.modelSpec) {
-					resolvedModel = modeResult.modelSpec;
-				} else if (modeResult.warning) {
-					ctx.hasUI && ctx.ui.notify(modeResult.warning, "warning");
-				}
-			}
-
 			try {
 				ctx.hasUI && ctx.ui.notify("Starting side-agent…", "info");
 				const started = await startAgent(pi, ctx, {
 					task: parsed.task,
-					model: resolvedModel,
+					model: parsed.model,
+					// pi-amplike mode; startAgent resolves it (explicit -model wins).
+					mode: parsed.mode,
 					includeSummary: true,
 				});
 
@@ -3936,6 +3949,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
 			model: Type.Optional(Type.String({ description: "Model as provider/modelId (optional)" })),
+			mode: Type.Optional(Type.String({ description: "pi-amplike mode name to run the agent in, e.g. 'rush', 'smart', 'deep' (optional; ignored when model is given)" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
@@ -3943,6 +3957,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					task: params.description,
 					branchHint: params.branchHint,
 					model: params.model,
+					mode: params.mode,
 					includeSummary: false,
 				});
 				return {
@@ -3976,7 +3991,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			let out = renderToolTitle(theme, "Agent Start", args.branchHint);
-			if (args.model) out += theme.fg("dim", `[${stripTerminalNoise(args.model)}] `);
+			const modelTag = args.model || args.mode;
+			if (modelTag) out += theme.fg("dim", `[${stripTerminalNoise(modelTag)}] `);
 			out += renderMultilineArg(theme, args.description);
 			return new Text(out, 0, 0);
 		},
@@ -4092,4 +4108,4 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 }
 
 /** Internals exposed for unit tests only (Pi loads just the default export). */
-export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock, formatStatusLine, listResumableSessions };
+export const __testing = { allocateWorktree, allocateWorktreeUnlocked, withFileLock, formatStatusLine, listResumableSessions, resolveRequestedModel };
