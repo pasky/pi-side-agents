@@ -3959,6 +3959,10 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent-start",
+		// Models often batch agent-start/agent-send with agent-wait-any/agent-check
+		// in one message; run such batches in order so the wait observes the new
+		// record / the `running` status set by the send instead of racing it.
+		executionMode: "sequential",
 		label: "Agent Start",
 		description:
 			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), waits for it, then closes it with a separate agent-send whose prompt is exactly '/quit' (a child cannot quit itself; '/quit' mentioned inside a prose message does nothing). Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 3); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
@@ -4067,6 +4071,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent-send",
+		executionMode: "sequential",
 		label: "Agent Send",
 		description:
 			"Send a steering/follow-up prompt to a child agent's tmux pane. The prompt is typed into the child's editor verbatim, so slash commands only work as the whole prompt: to close a finished child, send prompt exactly '/quit' (never 'Thanks — /quit.' — the child cannot quit itself and treats that as a chat message). Returns { ok: boolean, message: string, warning?: string }.",
@@ -4113,12 +4118,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		await setChildRuntimeStatus(ctx, "running").catch(() => {});
 	});
 
-	// Not agent_end: pi emits that before draining messages queued during the
-	// run's tail (e.g. an agent-send steer landing as the run finishes), auto-
-	// compaction or a retry — each of which starts a fresh run. Flipping to
-	// waiting_user there would let agent-wait-any return before the sent prompt
-	// was even processed.
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_end", async (_event, ctx) => {
 		await setChildRuntimeStatus(ctx, "waiting_user").catch(() => {});
 	});
 
