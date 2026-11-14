@@ -2900,7 +2900,18 @@ async function agentCheckPayload(stateRoot: string, agentId: string): Promise<Re
 	};
 }
 
-async function sendToAgent(stateRoot: string, agentId: string, prompt: string): Promise<{ ok: boolean; message: string }> {
+/** True when a prose prompt mentions `/quit` without being the slash command
+ * itself: the child cannot quit its own session, so such text is a no-op. */
+function mentionsQuitInProse(payload: string): boolean {
+	const trimmed = payload.trim();
+	return !trimmed.startsWith("/") && /(^|[^\w/])\/quit\b/.test(trimmed);
+}
+
+async function sendToAgent(
+	stateRoot: string,
+	agentId: string,
+	prompt: string,
+): Promise<{ ok: boolean; message: string; warning?: string }> {
 	const normalizedId = normalizeAgentId(agentId);
 	if (!normalizedId) {
 		return { ok: false, message: "No agent id was provided" };
@@ -2942,7 +2953,13 @@ async function sendToAgent(stateRoot: string, agentId: string, prompt: string): 
 		}
 	});
 
-	return { ok: true, message: `Sent prompt to ${normalizedId}` };
+	const result: { ok: boolean; message: string; warning?: string } = { ok: true, message: `Sent prompt to ${normalizedId}` };
+	if (mentionsQuitInProse(payload)) {
+		result.warning =
+			"This prompt mentions /quit inside prose, which the child only reads as a message — it cannot quit its own session. " +
+			`To close the child, call agent-send again with prompt exactly "/quit" (after it has finished/merged).`;
+	}
+	return result;
 }
 
 async function setChildRuntimeStatus(ctx: ExtensionContext, nextStatus: AgentStatus): Promise<void> {
@@ -3944,7 +3961,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-start",
 		label: "Agent Start",
 		description:
-			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), sends /quit when child is done. Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 3); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
+			"Start a background side agent in tmux/worktree. Lifecycle: child implements the change or asks for clarification -> wait-state and yield -> parent inspects (agent-check or agent-wait-any), reviews work, reacts -> eventually, parent asks child to wrap up (send 'LGTM, merge'), waits for it, then closes it with a separate agent-send whose prompt is exactly '/quit' (a child cannot quit itself; '/quit' mentioned inside a prose message does nothing). Provide a short kebab-case branchHint (max 3 words) for the agent's branch name. Side agents may themselves start agents (nesting is capped at depth 3); a nested agent branches off the caller's branch, merges back into it, and reports its status to the caller only. Returns { ok: true, id, parentAgentId?, depth, task, tmuxWindowId, tmuxWindowIndex, worktreePath, branch, warnings[] } on success, or { ok: false, error } on failure.",
 		parameters: Type.Object({
 			description: Type.String({ description: "Task description for child agent kickoff prompt (include all necessary context)" }),
 			branchHint: Type.String({ description: "Short kebab-case branch slug, max 3 words (e.g. fix-auth-leak)" }),
@@ -4052,10 +4069,10 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		name: "agent-send",
 		label: "Agent Send",
 		description:
-			"Send a steering/follow-up prompt to a child agent's tmux pane. Returns { ok: boolean, message: string }.",
+			"Send a steering/follow-up prompt to a child agent's tmux pane. The prompt is typed into the child's editor verbatim, so slash commands only work as the whole prompt: to close a finished child, send prompt exactly '/quit' (never 'Thanks — /quit.' — the child cannot quit itself and treats that as a chat message). Returns { ok: boolean, message: string, warning?: string }.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Agent id" }),
-			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first instead of organic steering, '/' for slash commands like /quit)" }),
+			prompt: Type.String({ description: "Prompt text to send (prefix with '!' to interrupt first instead of organic steering, '/' for slash commands — e.g. exactly '/quit' to close the child; the slash command must be the entire prompt)" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
@@ -4096,7 +4113,12 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		await setChildRuntimeStatus(ctx, "running").catch(() => {});
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	// Not agent_end: pi emits that before draining messages queued during the
+	// run's tail (e.g. an agent-send steer landing as the run finishes), auto-
+	// compaction or a retry — each of which starts a fresh run. Flipping to
+	// waiting_user there would let agent-wait-any return before the sent prompt
+	// was even processed.
+	pi.on("agent_settled", async (_event, ctx) => {
 		await setChildRuntimeStatus(ctx, "waiting_user").catch(() => {});
 	});
 

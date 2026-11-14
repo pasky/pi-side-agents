@@ -300,7 +300,7 @@ PI_SIDE_PARENT_REPO="$PI_SIDE_PARENT_REPO" .pi/side-agent-finish.sh
    - Parent-side integration is a bit sensitive operation as it can make big mess; solve simple issues yourself, but escalate to the user with major issues (such as dirty parent worktree)
    - Exit code 4 (nested agents only): the parent agent's checkout is no longer on its branch — the parent has quit or its slot was reused. Do not force anything; report that your branch is ready and needs manual integration.
 
-5. After success: report the landed commit(s). Suggest `/quit` if no further work is needed.
+5. After success: report the landed commit(s). If no further work is needed, say the session can be closed with `/quit` (only the user, or a parent agent via `agent-send` with prompt exactly `/quit`, can do that — you cannot quit yourself).
 ```
 
 **For PR policy**, write a simpler finish skill:
@@ -323,7 +323,7 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it"):
 .pi/side-agent-finish.sh
 ```
 
-3. Suggest `/quit` if no further work is needed.
+3. If no further work is needed, say the session can be closed with `/quit` (only the user, or a parent agent via `agent-send` with prompt exactly `/quit`, can do that — you cannot quit yourself).
 ```
 
 ---
