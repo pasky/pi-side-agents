@@ -22,6 +22,13 @@ const ENV_DEPTH = "PI_SIDE_AGENT_DEPTH";
 /** Opt-out of auto-closing a child's tmux window after a clean exit: when set
  * (non-empty, not "0"), the window waits for a keypress as it used to. */
 const ENV_NOCLOSE = "PI_SIDE_AGENT_NOCLOSE";
+/** Pid of the pi process that IS the side agent. The PI_SIDE_* identity is
+ * inherited by everything the agent runs — e.g. a background `pi -p` research
+ * job started from its bash tool — and such a descendant pi must not drive the
+ * agent's lifecycle (its agent_end would flip the agent to waiting_user while
+ * it is still working, its session_start would relink the agent's session).
+ * The first pi process loading this extension with an agent id claims it. */
+const ENV_OWNER_PID = "PI_SIDE_AGENT_OWNER_PID";
 /** Deepest agent that may exist; agents at this depth cannot spawn further. */
 const MAX_AGENT_DEPTH = 3;
 
@@ -1599,6 +1606,9 @@ export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
 # Propagate to nested agents (tmux windows don't inherit the parent pi's env).
 export ${ENV_NOCLOSE}=\"$NOCLOSE\"
+# The pi started below claims the agent identity (see ${ENV_OWNER_PID}); drop
+# any claim inherited from whatever started this script.
+unset ${ENV_OWNER_PID}
 
 iso_now() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -2976,7 +2986,7 @@ async function sendToAgent(
 
 async function setChildRuntimeStatus(ctx: ExtensionContext, nextStatus: AgentStatus): Promise<void> {
 	const agentId = process.env[ENV_AGENT_ID];
-	if (!agentId) return;
+	if (!agentId || !isChildRuntime()) return;
 
 	const stateRoot = getStateRoot(ctx);
 	await mutateRegistry(stateRoot, async (registry) => {
@@ -3061,7 +3071,7 @@ async function waitForAny(
 
 async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	const agentId = process.env[ENV_AGENT_ID];
-	if (!agentId) return;
+	if (!agentId || !isChildRuntime()) return;
 
 	const stateRoot = getStateRoot(ctx);
 	const childSession = ctx.sessionManager.getSessionFile();
@@ -3122,8 +3132,16 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 	}
 }
 
+function claimChildRuntime(): void {
+	if (process.env[ENV_AGENT_ID] && !process.env[ENV_OWNER_PID]) {
+		process.env[ENV_OWNER_PID] = String(process.pid);
+	}
+}
+
+/** Whether this process is the side agent itself (not merely a descendant
+ * process that inherited its environment). */
 function isChildRuntime(): boolean {
-	return Boolean(process.env[ENV_AGENT_ID]);
+	return Boolean(process.env[ENV_AGENT_ID]) && process.env[ENV_OWNER_PID] === String(process.pid);
 }
 
 /**
@@ -3621,6 +3639,7 @@ function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
 
 export default function sideAgentsExtension(pi: ExtensionAPI) {
+	claimChildRuntime();
 	pi.registerCommand("agent", {
 		description: "Spawn a background child agent in its own tmux window/worktree: /agent [-model <provider/id>] [-mode <name>] <task>",
 		handler: async (args, ctx) => {
